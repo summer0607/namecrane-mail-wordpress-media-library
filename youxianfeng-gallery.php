@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 游先锋图库
  * Description: 将媒体上传至游先锋邮箱存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 0.5.14
+ * Version: 0.5.16
  * Update URI: https://github.com/summer0607/youxianfeng-gallery
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '0.5.14';
+    const VERSION = '0.5.16';
     const GITHUB_REPOSITORY = 'summer0607/youxianfeng-gallery';
     const RELEASE_ASSET = 'youxianfeng-gallery.zip';
     const UPDATE_CACHE_KEY = 'yxf_gallery_github_release';
@@ -554,6 +554,8 @@ final class YouXianFeng_Gallery {
             CURLOPT_USERPWD       => $settings['sftp_username'] . ':' . $password,
             CURLOPT_CONNECTTIMEOUT=> 15,
             CURLOPT_TIMEOUT       => 40,
+            // 测试连接返回的目录内容不能直接输出，否则会污染 AJAX 的 JSON 结果。
+            CURLOPT_RETURNTRANSFER => true,
         ), $protocol_options));
         if (is_wp_error($configured)) { curl_close($curl); return $configured; }
         if ($protocol === 'sftp') {
@@ -657,9 +659,26 @@ final class YouXianFeng_Gallery {
     /** 远端文件先成功删除，才清理网站中的记录和虚拟媒体。 */
     private static function delete_item_with_remote_file($item) {
         list($settings, $password) = self::storage_settings_for_user((int) $item->author_id);
-        $deleted = self::storage_delete($settings, $password, (string) $item->remote_path);
+        $deleted = self::delete_remote_file_via_api($settings, $password, (string) $item->remote_path);
         if (is_wp_error($deleted)) {
             return $deleted;
+        }
+        // 邮箱服务有时会对删除命令返回成功但未真正落盘。确认文件已消失后，
+        // 才移除本地图库记录，避免用户误以为网盘文件已经删除。
+        $exists = true;
+        for ($attempt = 0; $attempt < 3; $attempt++) {
+            $file = self::remote_file_record($settings, $password, (string) $item->remote_path);
+            if (is_wp_error($file)) {
+                return $file;
+            }
+            $exists = (bool) $file;
+            if (!$exists) {
+                break;
+            }
+            sleep(1);
+        }
+        if ($exists) {
+            return new WP_Error('remote_delete_unconfirmed', '邮箱网盘未确认删除该图片，已保留图库记录，请稍后重试。');
         }
         global $wpdb;
         $wpdb->delete(self::table_name(), array('id' => (int) $item->id), array('%d'));
@@ -760,6 +779,35 @@ final class YouXianFeng_Gallery {
             sleep(1);
         }
         return new WP_Error('file_not_found', '图片已上传，但游先锋邮箱尚未返回文件记录，因此未生成公开链接。');
+    }
+
+    /** 通过邮箱网盘接口查找文件；删除必须使用该接口返回的真实文件 ID。 */
+    private static function remote_file_record($settings, $password, $remote_path) {
+        $token = self::api_login($settings, $password);
+        if (is_wp_error($token)) {
+            return $token;
+        }
+        $folders = self::api_request($settings, $token, 'GET', '/filestorage/folders');
+        if (is_wp_error($folders)) {
+            return $folders;
+        }
+        return self::find_file_in_tree($folders['folder'] ?? array(), wp_basename($remote_path));
+    }
+
+    /** 删除使用邮箱网盘网页端同一接口，而非不可靠的 FTP DELE 命令。 */
+    private static function delete_remote_file_via_api($settings, $password, $remote_path) {
+        $file = self::remote_file_record($settings, $password, $remote_path);
+        if (is_wp_error($file)) {
+            return $file;
+        }
+        if (!$file || empty($file['id'])) {
+            return new WP_Error('remote_file_missing', '邮箱网盘中未找到该图片，已停止删除操作。');
+        }
+        $token = self::api_login($settings, $password);
+        if (is_wp_error($token)) {
+            return $token;
+        }
+        return self::api_request($settings, $token, 'POST', '/filestorage/delete-files', array('fileIDs' => array($file['id'])));
     }
 
     public static function admin_menu() {
@@ -924,10 +972,18 @@ final class YouXianFeng_Gallery {
         }
         $remote_file = gmdate('Ymd-His') . '-' . wp_generate_password(8, false, false) . '-' . $file_name;
         $uploaded = self::storage_upload($settings, $password, $file['tmp_name'], $remote_file);
+        $upload_warning = '';
         if (is_wp_error($uploaded)) {
-            return $uploaded;
+            // 上传连接可能在文件已写入后才超时或断开。先到邮箱网盘确认，
+            // 已存在则按成功处理，避免队列误报失败和重复上传。
+            $original_url = self::create_public_link($settings, $password, $remote_file);
+            if (is_wp_error($original_url)) {
+                return $uploaded;
+            }
+            $upload_warning = '上传连接未返回完成状态，但已确认文件已保存到游先锋邮箱。';
+        } else {
+            $original_url = self::create_public_link($settings, $password, $remote_file);
         }
-        $original_url = self::create_public_link($settings, $password, $remote_file);
         $is_ready = !is_wp_error($original_url);
         $wpdb->insert(self::table_name(), array(
             'original_url' => $is_ready ? $original_url : '',
@@ -953,7 +1009,7 @@ final class YouXianFeng_Gallery {
         return array(
             'item'      => $item,
             'duplicate' => false,
-            'warning'   => $is_ready ? '' : $original_url->get_error_message(),
+            'warning'   => $upload_warning ?: ($is_ready ? '' : $original_url->get_error_message()),
         );
     }
 
