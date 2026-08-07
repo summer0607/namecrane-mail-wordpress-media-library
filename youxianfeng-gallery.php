@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 游先锋图库
  * Description: 将媒体上传至游先锋邮箱存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 0.5.2
+ * Version: 0.5.3
  * Update URI: https://github.com/summer0607/youxianfeng-gallery
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '0.5.2';
+    const VERSION = '0.5.3';
     const GITHUB_REPOSITORY = 'summer0607/youxianfeng-gallery';
     const RELEASE_ASSET = 'youxianfeng-gallery.zip';
     const UPDATE_CACHE_KEY = 'yxf_gallery_github_release';
@@ -21,13 +21,15 @@ final class YouXianFeng_Gallery {
     const CAPS_OPTION = 'yxf_gallery_caps_version';
     const TABLE_SUFFIX = 'yxf_gallery_items';
     const DB_OPTION = 'yxf_gallery_db_version';
-    const DB_VERSION = '3';
+    const DB_VERSION = '4';
 
     public static function init() {
         add_action('plugins_loaded', array(__CLASS__, 'maybe_upgrade'));
         add_action('admin_init', array(__CLASS__, 'enforce_login_gate'), 1);
         add_action('admin_menu', array(__CLASS__, 'admin_menu'));
         add_action('admin_init', array(__CLASS__, 'handle_admin_actions'));
+        add_action('wp_ajax_yxf_gallery_upload_image', array(__CLASS__, 'ajax_upload_image'));
+        add_action('wp_ajax_yxf_gallery_delete_remote_item', array(__CLASS__, 'ajax_delete_remote_item'));
         add_action('admin_post_yxf_gallery_check_update', array(__CLASS__, 'check_update_now'));
         add_action('admin_notices', array(__CLASS__, 'update_check_notice'));
         add_action('admin_enqueue_scripts', array(__CLASS__, 'enqueue_media_replacement'), 999);
@@ -57,12 +59,14 @@ final class YouXianFeng_Gallery {
             file_name varchar(255) NOT NULL DEFAULT '',
             mime_type varchar(100) NOT NULL DEFAULT '',
             remote_path varchar(500) NOT NULL DEFAULT '',
+            file_hash char(64) NOT NULL DEFAULT '',
             attachment_id bigint(20) unsigned NOT NULL DEFAULT 0,
             status varchar(20) NOT NULL DEFAULT 'ready',
             author_id bigint(20) unsigned NOT NULL DEFAULT 0,
             created_at datetime NOT NULL,
             PRIMARY KEY  (id),
             KEY author_id (author_id),
+            KEY author_file_hash (author_id, file_hash),
             KEY attachment_id (attachment_id),
             KEY created_at (created_at)
         ) {$charset};");
@@ -191,6 +195,14 @@ final class YouXianFeng_Gallery {
     public static function enqueue_media_replacement() {
         if (!self::media_replacement_enabled()) {
             return;
+        }
+        // 图库自身的上传页不能再被“接管上传按钮”的脚本二次拦截，
+        // 否则文件选择控件会被打开图库的动作覆盖，造成页面无法操作。
+        if (is_admin()) {
+            $screen = function_exists('get_current_screen') ? get_current_screen() : null;
+            if ($screen && strpos((string) $screen->id, 'yxf-gallery') !== false) {
+                return;
+            }
         }
         $dependencies = array('jquery');
         if (is_admin()) {
@@ -499,6 +511,13 @@ final class YouXianFeng_Gallery {
         return sprintf('%s://%s:%d/%s', $protocol, $settings['sftp_host'], $settings['sftp_port'], implode('/', array_map('rawurlencode', $parts)));
     }
 
+    /** 使用数据库保存的完整网盘路径构造删除请求地址。 */
+    private static function storage_path_url($settings, $remote_path) {
+        $protocol = $settings['storage_protocol'] === 'sftp' ? 'sftp' : 'ftp';
+        $parts = array_filter(explode('/', trim((string) $remote_path, '/')), 'strlen');
+        return sprintf('%s://%s:%d/%s', $protocol, $settings['sftp_host'], $settings['sftp_port'], implode('/', array_map('rawurlencode', $parts)));
+    }
+
     private static function storage_upload($settings, $password, $local_file, $remote_file) {
         $available = self::storage_test($settings, $password);
         if (is_wp_error($available)) {
@@ -531,6 +550,53 @@ final class YouXianFeng_Gallery {
         fclose($stream);
         curl_close($curl);
         return $ok === false ? new WP_Error('upload_failed', '图片上传失败：' . $error) : true;
+    }
+
+    /** 管理员删除时，同时删除图片所属用户邮箱网盘中的原文件。 */
+    private static function storage_delete($settings, $password, $remote_path) {
+        if ($password === '' || trim((string) $remote_path, '/') === '') {
+            return new WP_Error('delete_credentials', '该图片缺少可用的邮箱登录信息或网盘路径，未执行删除。');
+        }
+        $protocol = $settings['storage_protocol'] === 'sftp' ? 'sftp' : 'ftp';
+        $curl = curl_init();
+        curl_setopt_array($curl, array(
+            CURLOPT_URL            => self::storage_path_url($settings, $remote_path),
+            CURLOPT_USERNAME       => $settings['sftp_username'],
+            CURLOPT_PASSWORD       => $password,
+            // 每次仅删除一张图片；设置较短超时，避免邮箱服务异常拖垮后台页面。
+            CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_TIMEOUT        => 12,
+            CURLOPT_PROTOCOLS_STR  => $protocol,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FAILONERROR    => true,
+        ));
+        if ($protocol === 'sftp') {
+            curl_setopt($curl, CURLOPT_SSH_AUTH_TYPES, CURLSSH_AUTH_PASSWORD);
+            curl_setopt($curl, CURLOPT_NOBODY, true);
+            curl_setopt($curl, CURLOPT_QUOTE, array('rm ' . (string) $remote_path));
+        } else {
+            curl_setopt($curl, CURLOPT_USE_SSL, CURLUSESSL_ALL);
+            curl_setopt($curl, CURLOPT_CUSTOMREQUEST, 'DELE');
+        }
+        $ok = curl_exec($curl);
+        $error = curl_error($curl);
+        curl_close($curl);
+        return $ok === false ? new WP_Error('remote_delete_failed', '邮箱网盘文件删除失败：' . $error) : true;
+    }
+
+    /** 远端文件先成功删除，才清理网站中的记录和虚拟媒体。 */
+    private static function delete_item_with_remote_file($item) {
+        list($settings, $password) = self::storage_settings_for_user((int) $item->author_id);
+        $deleted = self::storage_delete($settings, $password, (string) $item->remote_path);
+        if (is_wp_error($deleted)) {
+            return $deleted;
+        }
+        global $wpdb;
+        $wpdb->delete(self::table_name(), array('id' => (int) $item->id), array('%d'));
+        if (!empty($item->attachment_id)) {
+            wp_delete_attachment((int) $item->attachment_id, true);
+        }
+        return true;
     }
 
     private static function api_request($settings, $token, $method, $path, $body = null) {
@@ -632,8 +698,8 @@ final class YouXianFeng_Gallery {
         add_submenu_page('yxf-gallery', '上传图片', '上传图片', self::CAPABILITY, 'yxf-gallery-upload', array(__CLASS__, 'render_upload_page'));
         add_submenu_page('yxf-gallery', '登录', '登录', self::CAPABILITY, 'yxf-gallery-login', array(__CLASS__, 'render_login_page'));
         add_submenu_page('yxf-gallery', '图库设置', '设置', 'manage_options', 'yxf-gallery-settings', array(__CLASS__, 'render_settings_page'));
-        // 管理图片是管理员专用入口，不出现在作者、编辑的图库菜单中。
-        add_menu_page('管理图片', '管理图片', 'manage_options', 'yxf-gallery-manage', array(__CLASS__, 'render_manage_page'), 'dashicons-admin-media', 59);
+        // 管理图片是管理员专用二级菜单，不出现在作者、编辑的图库菜单中。
+        add_submenu_page('yxf-gallery', '管理图片', '管理图片', 'manage_options', 'yxf-gallery-manage', array(__CLASS__, 'render_manage_page'));
     }
 
     public static function handle_admin_actions() {
@@ -709,51 +775,10 @@ final class YouXianFeng_Gallery {
                 wp_die('无权上传图库图片。');
             }
             check_admin_referer('yxf_gallery_upload');
-            $file = $_FILES['gallery_file'] ?? null;
-            if (!$file || !empty($file['error']) || empty($file['tmp_name'])) {
-                self::redirect('yxf-gallery-upload', 'upload_error');
-            }
-            $file_name = sanitize_file_name((string) $file['name']);
-            $type = wp_check_filetype_and_ext($file['tmp_name'], $file_name);
-            if (empty($type['type'])) {
-                self::redirect('yxf-gallery-upload', 'not_allowed');
-            }
-            $max_size = (int) apply_filters('yxf_gallery_max_upload_size', 1024 * MB_IN_BYTES);
-            if ((int) $file['size'] > $max_size) {
-                self::redirect('yxf-gallery-upload', 'too_large');
-            }
-            list($settings, $password) = self::storage_settings_for_user();
-            if ($password === '') {
-                self::redirect('yxf-gallery-login', 'login_required');
-            }
-            $remote_file = gmdate('Ymd-His') . '-' . wp_generate_password(8, false, false) . '-' . $file_name;
-            $uploaded = self::storage_upload($settings, $password, $file['tmp_name'], $remote_file);
-            if (is_wp_error($uploaded)) {
-                set_transient('yxf_gallery_notice_' . get_current_user_id(), array('error', $uploaded->get_error_message()), MINUTE_IN_SECONDS);
+            $result = self::upload_gallery_file($_FILES['gallery_file'] ?? null);
+            if (is_wp_error($result)) {
+                set_transient('yxf_gallery_notice_' . get_current_user_id(), array('error', $result->get_error_message()), MINUTE_IN_SECONDS);
                 self::redirect('yxf-gallery-upload', 'stored_notice');
-            }
-            $original_url = self::create_public_link($settings, $password, $remote_file);
-            global $wpdb;
-            $is_ready = !is_wp_error($original_url);
-            $wpdb->insert(self::table_name(), array(
-                'original_url' => $is_ready ? $original_url : '',
-                'output_url'   => $is_ready ? self::rewrite_url($original_url) : '',
-                'file_name'    => $file_name,
-                'mime_type'    => $type['type'],
-                'remote_path'  => rtrim($settings['sftp_remote_path'], '/') . '/' . $remote_file,
-                'status'       => $is_ready ? 'ready' : 'pending',
-                'author_id'    => get_current_user_id(),
-                'created_at'   => current_time('mysql'),
-            ), array('%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s'));
-            if (!$is_ready) {
-                set_transient('yxf_gallery_notice_' . get_current_user_id(), array('warning', '媒体已上传到游先锋邮箱，但暂未获取到公开链接。图库已保留待处理记录：' . $original_url->get_error_message()), MINUTE_IN_SECONDS);
-                self::redirect('yxf-gallery-upload', 'stored_notice');
-            }
-            if (self::media_replacement_enabled() && $wpdb->insert_id) {
-                $item = $wpdb->get_row($wpdb->prepare('SELECT * FROM ' . self::table_name() . ' WHERE id = %d', $wpdb->insert_id));
-                if ($item) {
-                    self::ensure_virtual_attachment($item);
-                }
             }
             self::redirect('yxf-gallery', 'uploaded');
         }
@@ -778,6 +803,133 @@ final class YouXianFeng_Gallery {
             }
             self::redirect(self::can_administer() ? 'yxf-gallery-manage' : 'yxf-gallery', 'deleted');
         }
+
+        if ($action === 'delete_items_remote') {
+            if (!self::can_administer()) {
+                wp_die('无权删除邮箱网盘中的图片。');
+            }
+            check_admin_referer('yxf_gallery_delete_remote');
+            set_transient('yxf_gallery_notice_' . get_current_user_id(), array('warning', '请在管理图片页面使用批量删除按钮；图片会逐张删除以避免后台超时。'), MINUTE_IN_SECONDS);
+            self::redirect('yxf-gallery-manage', 'stored_notice');
+        }
+    }
+
+    /** 上传一张图片并以内容指纹去重，供普通表单和队列接口共用。 */
+    private static function upload_gallery_file($file) {
+        if (!$file || !empty($file['error']) || empty($file['tmp_name']) || !is_uploaded_file($file['tmp_name'])) {
+            return new WP_Error('upload_error', '请选择有效的图片文件。');
+        }
+        $file_name = sanitize_file_name((string) $file['name']);
+        $type = wp_check_filetype_and_ext($file['tmp_name'], $file_name);
+        if (empty($type['type']) || strpos((string) $type['type'], 'image/') !== 0) {
+            return new WP_Error('not_image', '仅支持上传图片文件。');
+        }
+        $max_size = (int) apply_filters('yxf_gallery_max_upload_size', 1024 * MB_IN_BYTES);
+        if ((int) $file['size'] > $max_size) {
+            return new WP_Error('too_large', '单个图片文件不能超过 1GB。');
+        }
+        $file_hash = hash_file('sha256', $file['tmp_name']);
+        if (!$file_hash) {
+            return new WP_Error('hash_failed', '无法识别图片内容，请重新选择图片。');
+        }
+        global $wpdb;
+        $existing = $wpdb->get_row($wpdb->prepare(
+            'SELECT * FROM ' . self::table_name() . ' WHERE author_id = %d AND file_hash = %s ORDER BY id DESC LIMIT 1',
+            get_current_user_id(),
+            $file_hash
+        ));
+        if ($existing) {
+            if ((string) $existing->status === 'ready' && self::media_replacement_enabled()) {
+                $attachment_id = self::ensure_virtual_attachment($existing);
+                if ($attachment_id) {
+                    $existing->attachment_id = $attachment_id;
+                }
+            }
+            return array('item' => $existing, 'duplicate' => true);
+        }
+        list($settings, $password) = self::storage_settings_for_user();
+        if ($password === '') {
+            return new WP_Error('login_required', '请先在“登录”中保存自己的游先锋邮箱账号和密码。');
+        }
+        $remote_file = gmdate('Ymd-His') . '-' . wp_generate_password(8, false, false) . '-' . $file_name;
+        $uploaded = self::storage_upload($settings, $password, $file['tmp_name'], $remote_file);
+        if (is_wp_error($uploaded)) {
+            return $uploaded;
+        }
+        $original_url = self::create_public_link($settings, $password, $remote_file);
+        $is_ready = !is_wp_error($original_url);
+        $wpdb->insert(self::table_name(), array(
+            'original_url' => $is_ready ? $original_url : '',
+            'output_url'   => $is_ready ? self::rewrite_url($original_url) : '',
+            'file_name'    => $file_name,
+            'mime_type'    => $type['type'],
+            'remote_path'  => rtrim($settings['sftp_remote_path'], '/') . '/' . $remote_file,
+            'file_hash'    => $file_hash,
+            'status'       => $is_ready ? 'ready' : 'pending',
+            'author_id'    => get_current_user_id(),
+            'created_at'   => current_time('mysql'),
+        ), array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s'));
+        if (!$wpdb->insert_id) {
+            return new WP_Error('record_failed', '图片已上传，但图库记录保存失败，请不要重复上传并联系管理员。');
+        }
+        $item = $wpdb->get_row($wpdb->prepare('SELECT * FROM ' . self::table_name() . ' WHERE id = %d', $wpdb->insert_id));
+        if ($is_ready && self::media_replacement_enabled() && $item) {
+            $attachment_id = self::ensure_virtual_attachment($item);
+            if ($attachment_id) {
+                $item->attachment_id = $attachment_id;
+            }
+        }
+        return array(
+            'item'      => $item,
+            'duplicate' => false,
+            'warning'   => $is_ready ? '' : $original_url->get_error_message(),
+        );
+    }
+
+    /** 图片上传队列接口：每次仅处理一个队列项，便于准确显示状态和失败原因。 */
+    public static function ajax_upload_image() {
+        if (!self::can_use_gallery()) {
+            wp_send_json_error(array('message' => '无权上传图库图片。'), 403);
+        }
+        check_ajax_referer('yxf_gallery_upload', 'nonce');
+        $result = self::upload_gallery_file($_FILES['gallery_file'] ?? null);
+        if (is_wp_error($result)) {
+            wp_send_json_error(array('message' => $result->get_error_message()), 400);
+        }
+        $item = $result['item'];
+        wp_send_json_success(array(
+            'id'        => (int) ($item->id ?? 0),
+            'attachmentId' => (int) ($item->attachment_id ?? 0),
+            'name'      => (string) ($item->file_name ?? ''),
+            'url'       => $item && $item->status === 'ready' ? self::item_public_url($item) : '',
+            'mime'      => (string) ($item->mime_type ?? ''),
+            'kind'      => strtok((string) ($item->mime_type ?? ''), '/'),
+            'createdAt' => (string) ($item->created_at ?? current_time('mysql')),
+            'duplicate' => !empty($result['duplicate']),
+            'warning'   => (string) ($result['warning'] ?? ''),
+        ));
+    }
+
+    /** 每个请求只删除一张图片，批量操作由浏览器顺序发起，避免超时中断整个后台页面。 */
+    public static function ajax_delete_remote_item() {
+        if (!self::can_administer()) {
+            wp_send_json_error(array('message' => '无权删除邮箱网盘中的图片。'), 403);
+        }
+        check_ajax_referer('yxf_gallery_delete_remote', 'nonce');
+        $item_id = absint($_POST['item_id'] ?? 0);
+        if (!$item_id) {
+            wp_send_json_error(array('message' => '未找到需要删除的图片。'), 400);
+        }
+        global $wpdb;
+        $item = $wpdb->get_row($wpdb->prepare('SELECT * FROM ' . self::table_name() . ' WHERE id = %d', $item_id));
+        if (!$item) {
+            wp_send_json_error(array('message' => '该图片已不存在。'), 404);
+        }
+        $result = self::delete_item_with_remote_file($item);
+        if (is_wp_error($result)) {
+            wp_send_json_error(array('message' => $result->get_error_message()), 400);
+        }
+        wp_send_json_success(array('id' => $item_id, 'name' => (string) ($item->file_name ?: ('图片 #' . $item_id))));
     }
 
     private static function redirect($page, $notice) {
@@ -966,11 +1118,12 @@ final class YouXianFeng_Gallery {
         }
         global $wpdb;
         $items = $wpdb->get_results($wpdb->prepare("SELECT * FROM " . self::table_name() . " WHERE author_id = %d ORDER BY id DESC LIMIT 100", get_current_user_id()));
+        $account = self::account();
         ?>
         <div class="wrap yxf-gallery-wrap">
             <h1>我的媒体库</h1>
             <?php self::notices(); ?>
-            <p><a class="button button-primary" href="<?php echo esc_url(admin_url('admin.php?page=yxf-gallery-upload')); ?>">上传媒体</a> <a class="button" href="<?php echo esc_url(admin_url('admin.php?page=yxf-gallery-login')); ?>">登录游先锋邮箱</a></p>
+            <p><a class="button button-primary" href="<?php echo esc_url(admin_url('admin.php?page=yxf-gallery-upload')); ?>">上传图片</a> <?php if (self::user_has_login()) : ?><a class="button-link" style="color:#00a32a;font-weight:600;text-decoration:none" href="<?php echo esc_url(admin_url('admin.php?page=yxf-gallery-login')); ?>">已登陆：<?php echo esc_html($account['username']); ?></a><?php else : ?><a class="button" href="<?php echo esc_url(admin_url('admin.php?page=yxf-gallery-login')); ?>">登录游先锋邮箱</a><?php endif; ?></p>
             <p class="description">这里仅显示你上传到自己游先锋邮箱网盘的媒体文件。</p>
             <?php if (!$items) : ?>
                 <div class="notice notice-info inline"><p>图库暂无媒体文件。请先上传一个文件。</p></div>
@@ -997,19 +1150,32 @@ final class YouXianFeng_Gallery {
         }
         ?>
         <div class="wrap">
-            <h1>上传媒体</h1>
+            <h1>上传图片</h1>
             <?php self::notices(); ?>
             <?php if (!self::user_has_login()) : ?><div class="notice notice-warning inline"><p>请先在“登录”中填写你自己的游先锋邮箱账号，媒体只会上传到该账号的网盘。<a href="<?php echo esc_url(admin_url('admin.php?page=yxf-gallery-login')); ?>">去登录</a></p></div><?php endif; ?>
-            <div class="card" style="max-width:900px;padding:18px 22px;margin-top:18px">
-                <p>媒体文件会临时经过网站后上传到你自己的游先锋邮箱网盘，再自动生成公开链接。网站媒体库不会保存原文件。</p>
-                <form method="post" enctype="multipart/form-data">
-                    <?php wp_nonce_field('yxf_gallery_upload'); ?>
-                    <input type="hidden" name="yxf_gallery_action" value="upload_image">
-                    <input name="gallery_file" type="file" required <?php disabled(!self::user_has_login()); ?>>
-                    <p><button class="button button-primary" <?php disabled(!self::user_has_login()); ?>>上传到我的媒体库</button></p>
-                </form>
+            <div class="card yxf-upload-card" style="max-width:900px;padding:22px;margin-top:18px">
+                <p>选择图片后会先进入上传队列。每张相同图片只会上传一次，可继续选择更多图片加入队列。</p>
+                <input id="yxf-gallery-files" type="file" accept="image/*" multiple class="screen-reader-text" <?php disabled(!self::user_has_login()); ?>>
+                <p class="yxf-upload-actions"><button type="button" class="button" id="yxf-gallery-choose" <?php disabled(!self::user_has_login()); ?>>选择图片</button> <button type="button" class="button button-primary" id="yxf-gallery-start" disabled>开始上传</button></p>
+                <ul class="yxf-upload-queue" id="yxf-gallery-queue" aria-live="polite"></ul>
             </div>
         </div>
+        <style>
+            .yxf-upload-actions{display:flex;gap:8px;align-items:center}.yxf-upload-queue{margin:20px 0 0;border-top:1px solid #dcdcde}.yxf-upload-queue:empty{display:none}.yxf-upload-item{display:flex;gap:12px;align-items:center;padding:12px 2px;border-bottom:1px solid #f0f0f1}.yxf-upload-item-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.yxf-upload-item-status{font-size:12px;color:#646970}.yxf-upload-item.is-uploading .yxf-upload-item-status{color:#2271b1}.yxf-upload-item.is-success .yxf-upload-item-status{color:#00a32a}.yxf-upload-item.is-error .yxf-upload-item-status{color:#d63638}.yxf-upload-item-remove{color:#b32d2e;border:0;background:none;cursor:pointer}
+        </style>
+        <script>
+        (function(){
+            var input=document.getElementById('yxf-gallery-files'), choose=document.getElementById('yxf-gallery-choose'), start=document.getElementById('yxf-gallery-start'), list=document.getElementById('yxf-gallery-queue');
+            if(!input||!choose||!start||!list){return;}
+            var queue=new Map(), uploading=false, ajaxUrl=<?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>, nonce=<?php echo wp_json_encode(wp_create_nonce('yxf_gallery_upload')); ?>;
+            function key(file){return [file.name,file.size,file.lastModified].join(':');}
+            function render(){list.innerHTML='';queue.forEach(function(item,id){var row=document.createElement('li');row.className='yxf-upload-item is-'+item.state;row.innerHTML='<span class="yxf-upload-item-name"></span><span class="yxf-upload-item-status"></span>';row.querySelector('.yxf-upload-item-name').textContent=item.file.name;row.querySelector('.yxf-upload-item-status').textContent=item.message;if(item.state==='waiting'||item.state==='error'){var remove=document.createElement('button');remove.type='button';remove.className='yxf-upload-item-remove';remove.textContent='移除';remove.addEventListener('click',function(){queue.delete(id);render();});row.appendChild(remove);}list.appendChild(row);});start.disabled=uploading||![...queue.values()].some(function(item){return item.state==='waiting'||item.state==='error';});}
+            function add(files){Array.prototype.forEach.call(files,function(file){if(!file.type.match(/^image\//)){return;}var id=key(file);if(!queue.has(id)){queue.set(id,{file:file,state:'waiting',message:'等待上传'});}});input.value='';render();}
+            async function send(item){item.state='uploading';item.message='正在上传…';render();var data=new FormData();data.append('action','yxf_gallery_upload_image');data.append('nonce',nonce);data.append('gallery_file',item.file,item.file.name);try{var response=await fetch(ajaxUrl,{method:'POST',body:data,credentials:'same-origin'});var payload=await response.json();if(!payload.success){throw new Error((payload.data&&payload.data.message)||'上传失败，请重试。');}item.state='success';item.message=payload.data.duplicate?'已存在，无需重复上传':(payload.data.warning?'已上传，公开链接正在生成':'上传完成');}catch(error){item.state='error';item.message=error.message||'上传失败，请重试。';}render();}
+            async function run(){if(uploading){return;}uploading=true;render();for(const item of queue.values()){if(item.state==='waiting'||item.state==='error'){await send(item);}}uploading=false;render();}
+            choose.addEventListener('click',function(){input.click();});input.addEventListener('change',function(){add(input.files);});start.addEventListener('click',run);render();
+        }());
+        </script>
         <?php
     }
 
@@ -1045,19 +1211,27 @@ final class YouXianFeng_Gallery {
         <div class="wrap yxf-gallery-wrap">
             <h1>管理图片</h1>
             <?php self::notices(); ?>
-            <p class="description">这里可查看所有用户上传的图库记录，并删除网站中的图库记录；删除不会移除用户游先锋邮箱网盘中的原文件。</p>
+            <p class="description">这里可查看所有用户上传的图片。删除时会同时删除对应用户游先锋邮箱网盘中的原文件和网站图库记录。</p>
             <?php if (!$items) : ?><div class="notice notice-info inline"><p>暂无用户上传图片。</p></div><?php else : ?>
-                <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:16px;max-width:1280px">
-                    <?php foreach ($items as $item) : ?>
-                        <?php $item_url = $item->status === 'ready' ? self::item_public_url($item) : ''; ?>
-                        <article class="card" style="padding:10px;overflow:hidden">
-                            <?php if ($item->status === 'ready' && strpos((string) $item->mime_type, 'image/') === 0) : ?><img src="<?php echo esc_url($item_url); ?>" alt="" loading="lazy" decoding="async" style="display:block;width:100%;height:140px;object-fit:cover;background:#f0f0f1"><?php elseif ($item->status === 'ready') : ?><a href="<?php echo esc_url($item_url); ?>" target="_blank" rel="noopener" style="height:140px;display:flex;align-items:center;justify-content:center;background:#f6f7f7;color:#2271b1;text-decoration:none">媒体文件<br><?php echo esc_html(strtoupper((string) $item->mime_type)); ?></a><?php else : ?><div style="height:140px;display:flex;align-items:center;justify-content:center;background:#f6f7f7;color:#646970">等待公开链接</div><?php endif; ?>
-                            <p style="margin:10px 0 6px;word-break:break-all"><strong><?php echo esc_html($item->file_name ?: '图片'); ?></strong><br><small>上传用户：<?php echo esc_html($item->display_name ?: $item->user_login ?: ('用户 #' . $item->author_id)); ?></small></p>
-                            <p style="margin:0 0 10px;display:flex;gap:6px"><input class="widefat" type="text" readonly value="<?php echo esc_attr($item->status === 'ready' ? $item_url : '公开链接待生成'); ?>"><?php if ($item->status === 'ready') : ?><button class="button yxf-copy-link" type="button" data-copy-url="<?php echo esc_attr($item_url); ?>">复制链接</button><?php endif; ?></p>
-                            <form method="post" onsubmit="return confirm('仅删除图库记录，不会删除用户网盘中的原文件。确定继续吗？');"><?php wp_nonce_field('yxf_gallery_delete'); ?><input type="hidden" name="yxf_gallery_action" value="delete_item"><input type="hidden" name="item_id" value="<?php echo absint($item->id); ?>"><button class="button button-small button-link-delete">删除图片记录</button></form>
-                        </article>
-                    <?php endforeach; ?>
-                </div>
+                <form method="post" id="yxf-gallery-manage-form" data-ajax-url="<?php echo esc_url(admin_url('admin-ajax.php')); ?>" data-nonce="<?php echo esc_attr(wp_create_nonce('yxf_gallery_delete_remote')); ?>">
+                    <?php wp_nonce_field('yxf_gallery_delete_remote'); ?>
+                    <input type="hidden" name="yxf_gallery_action" value="delete_items_remote">
+                    <p style="display:flex;align-items:center;gap:10px;margin:16px 0"><button type="button" class="button" id="yxf-gallery-select-all">全选</button><button type="button" class="button button-primary" id="yxf-gallery-delete-selected">删除选中图片及网盘文件</button><span class="description" id="yxf-gallery-selected-count">未选择图片</span></p>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:16px;max-width:1280px">
+                        <?php foreach ($items as $item) : ?>
+                            <?php $item_url = $item->status === 'ready' ? self::item_public_url($item) : ''; ?>
+                            <article class="card yxf-gallery-manage-item" data-item-id="<?php echo absint($item->id); ?>" style="position:relative;padding:10px;overflow:hidden">
+                                <label style="position:absolute;z-index:2;top:16px;left:16px;display:flex;align-items:center;justify-content:center;width:28px;height:28px;background:#fff;border-radius:50%;box-shadow:0 1px 3px rgba(0,0,0,.22)"><input class="yxf-gallery-item-check" type="checkbox" name="item_ids[]" value="<?php echo absint($item->id); ?>" aria-label="选择 <?php echo esc_attr($item->file_name ?: '图片'); ?>"></label>
+                                <?php if ($item->status === 'ready' && strpos((string) $item->mime_type, 'image/') === 0) : ?><img src="<?php echo esc_url($item_url); ?>" alt="" loading="lazy" decoding="async" style="display:block;width:100%;height:140px;object-fit:cover;background:#f0f0f1"><?php elseif ($item->status === 'ready') : ?><a href="<?php echo esc_url($item_url); ?>" target="_blank" rel="noopener" style="height:140px;display:flex;align-items:center;justify-content:center;background:#f6f7f7;color:#2271b1;text-decoration:none">媒体文件<br><?php echo esc_html(strtoupper((string) $item->mime_type)); ?></a><?php else : ?><div style="height:140px;display:flex;align-items:center;justify-content:center;background:#f6f7f7;color:#646970">等待公开链接</div><?php endif; ?>
+                                <p style="margin:10px 0 6px;word-break:break-all"><strong><?php echo esc_html($item->file_name ?: '图片'); ?></strong><br><small>上传用户：<?php echo esc_html($item->display_name ?: $item->user_login ?: ('用户 #' . $item->author_id)); ?></small></p>
+                                <p style="margin:0;display:flex;gap:6px"><input class="widefat" type="text" readonly value="<?php echo esc_attr($item->status === 'ready' ? $item_url : '公开链接待生成'); ?>"><?php if ($item->status === 'ready') : ?><button class="button yxf-copy-link" type="button" data-copy-url="<?php echo esc_attr($item_url); ?>">复制链接</button><?php endif; ?></p>
+                            </article>
+                        <?php endforeach; ?>
+                    </div>
+                </form>
+                <script>
+                (function(){var form=document.getElementById('yxf-gallery-manage-form'),all=document.getElementById('yxf-gallery-select-all'),remove=document.getElementById('yxf-gallery-delete-selected'),count=document.getElementById('yxf-gallery-selected-count');if(!form||!all||!remove||!count)return;var checks=function(){return [].slice.call(document.querySelectorAll('.yxf-gallery-item-check'));};var refresh=function(){var list=checks(),selected=list.filter(function(check){return check.checked;}).length;count.textContent=selected?'已选择 '+selected+' 张图片':'未选择图片';all.textContent=list.length&&selected===list.length?'取消全选':'全选';remove.disabled=!selected;};all.addEventListener('click',function(){var list=checks(),shouldSelect=list.some(function(check){return !check.checked;});list.forEach(function(check){check.checked=shouldSelect;});refresh();});document.addEventListener('change',function(event){if(event.target.classList.contains('yxf-gallery-item-check'))refresh();});form.addEventListener('submit',function(event){event.preventDefault();});remove.addEventListener('click',async function(){var selected=checks().filter(function(check){return check.checked;});if(!selected.length||!window.confirm('将永久删除所选图片的邮箱网盘原文件和网站图库记录，无法恢复。确定继续吗？'))return;remove.disabled=true;all.disabled=true;var failed=[];for(var index=0;index<selected.length;index++){var check=selected[index],card=check.closest('.yxf-gallery-manage-item'),data=new FormData();data.append('action','yxf_gallery_delete_remote_item');data.append('nonce',form.getAttribute('data-nonce'));data.append('item_id',check.value);remove.textContent='正在删除 '+(index+1)+'/'+selected.length;card.style.opacity='.55';try{var response=await fetch(form.getAttribute('data-ajax-url'),{method:'POST',body:data,credentials:'same-origin'}),payload=await response.json();if(!payload.success)throw new Error((payload.data&&payload.data.message)||'删除失败');card.remove();}catch(error){card.style.opacity='1';failed.push((card.querySelector('strong')||{}).textContent||('图片 #'+check.value));}}remove.textContent='删除选中图片及网盘文件';all.disabled=false;refresh();if(failed.length){window.alert('以下图片未删除：'+failed.join('、'));}else{window.alert('已删除 '+selected.length+' 张图片及其邮箱网盘文件。');}});refresh();}());
+                </script>
             <?php endif; ?>
         </div>
         <?php self::render_copy_script();
@@ -1193,10 +1367,9 @@ final class YouXianFeng_Gallery {
         $requested_type = in_array($requested_type, array('image', 'video', 'audio', 'file', 'all'), true) ? $requested_type : 'all';
         // 从任何上传/添加图片入口进入时，都应先显示上传文件页。
         $active_tab = sanitize_key(wp_unslash($_GET['yxf_gallery_tab'] ?? 'upload')) === 'library' ? 'library' : 'upload';
-        $upload_action = add_query_arg(array_filter(array('type' => 'yxf_gallery', 'yxf_gallery_tab' => 'upload', 'post_id' => $post_id, 'yxf_gallery_callback' => $callback, 'yxf_gallery_multiple' => $multiple, 'yxf_gallery_type' => $requested_type)), admin_url('media-upload.php'));
         ?>
         <style>
-            html,body{height:100%;min-height:100%;margin:0;background:#f0f0f1;overflow:hidden}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#1d2327}.yxf-media-frame{position:fixed;inset:0;display:flex;flex-direction:column;background:#fff}.yxf-media-tabs{height:56px;display:flex;align-items:flex-end;padding:0 24px;border-bottom:1px solid #dcdcde;background:#fff}.yxf-media-tab{height:56px;padding:0 14px;border:0;border-bottom:4px solid transparent;background:transparent;color:#50575e;font-size:14px;cursor:pointer}.yxf-media-tab.is-active{border-bottom-color:#2271b1;color:#1d2327;font-weight:600}.yxf-media-body{position:relative;flex:1;min-height:0}.yxf-media-panel{display:none;height:100%}.yxf-media-panel.is-active{display:block}.yxf-upload-panel{box-sizing:border-box;padding:40px;overflow:auto}.yxf-upload-box{max-width:760px;margin:0 auto;padding:56px 30px;border:2px dashed #c3c4c7;border-radius:4px;background:#f6f7f7;text-align:center}.yxf-upload-box h2{margin:0 0 10px;font-size:20px}.yxf-upload-box p{color:#646970}.yxf-upload-box input[type=file]{display:block;max-width:100%;margin:22px auto}.yxf-library-panel{display:flex;flex-direction:column}.yxf-library-toolbar{display:flex;align-items:center;gap:10px;min-height:54px;padding:0 18px;border-bottom:1px solid #dcdcde;background:#f6f7f7}.yxf-library-toolbar select{min-width:128px}.yxf-library-toolbar input{margin-left:auto;width:260px;max-width:42%;height:30px}.yxf-library-main{display:flex;flex:1;min-height:0}.yxf-attachments{flex:1;display:grid;grid-template-columns:repeat(auto-fill,minmax(112px,1fr));align-content:start;gap:16px;margin:0;padding:20px;overflow:auto;list-style:none}.yxf-attachment{position:relative;aspect-ratio:1;border:1px solid #dcdcde;background:#f0f0f1;cursor:pointer;overflow:hidden}.yxf-attachment img{width:100%;height:100%;object-fit:cover;display:block}.yxf-file-icon{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#646970;font-size:12px;padding:12px;text-align:center;word-break:break-all}.yxf-file-icon b{font-size:28px;line-height:1;margin-bottom:10px;color:#2271b1}.yxf-attachment.is-selected{border:3px solid #2271b1}.yxf-attachment.is-selected:after{content:"✓";position:absolute;right:0;top:0;width:24px;height:24px;background:#2271b1;color:#fff;font-weight:700;text-align:center;line-height:24px}.yxf-empty{grid-column:1/-1;padding:70px 20px;text-align:center;color:#646970}.yxf-details{width:300px;box-sizing:border-box;padding:20px;border-left:1px solid #dcdcde;background:#fff;overflow:auto}.yxf-details.is-empty{color:#646970;padding-top:70px;text-align:center}.yxf-details img,.yxf-details video{width:100%;height:190px;object-fit:contain;background:#f0f0f1;margin-bottom:18px}.yxf-detail-title{margin:0 0 14px;font-size:15px;word-break:break-word}.yxf-detail-meta{margin:6px 0;color:#646970;font-size:12px;word-break:break-all}.yxf-detail-url{display:block;max-height:64px;overflow:auto;color:#2271b1;font-size:12px;word-break:break-all}.yxf-detail-actions{display:flex;gap:8px;margin-top:16px}.yxf-media-footer{display:flex;justify-content:flex-end;gap:8px;min-height:60px;padding:12px 18px;box-sizing:border-box;border-top:1px solid #dcdcde;background:#fff}.yxf-media-footer .button{height:32px}.yxf-notice{margin:16px 0}.yxf-hidden{display:none!important}@media(max-width:720px){.yxf-details{width:240px}.yxf-library-toolbar input{width:160px}.yxf-attachments{grid-template-columns:repeat(auto-fill,minmax(88px,1fr));gap:10px;padding:12px}}
+            html,body{height:100%;min-height:100%;margin:0;background:#f0f0f1;overflow:hidden}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#1d2327}.yxf-media-frame{position:fixed;inset:0;display:flex;flex-direction:column;background:#fff}.yxf-media-tabs{height:56px;display:flex;align-items:flex-end;padding:0 24px;border-bottom:1px solid #dcdcde;background:#fff}.yxf-media-tab{height:56px;padding:0 14px;border:0;border-bottom:4px solid transparent;background:transparent;color:#50575e;font-size:14px;cursor:pointer}.yxf-media-tab.is-active{border-bottom-color:#2271b1;color:#1d2327;font-weight:600}.yxf-media-body{position:relative;flex:1;min-height:0}.yxf-media-panel{display:none;height:100%}.yxf-media-panel.is-active{display:block}.yxf-upload-panel{box-sizing:border-box;padding:28px 40px;overflow:auto}.yxf-upload-box{max-width:760px;margin:0 auto;padding:40px 30px;border:2px dashed #c3c4c7;border-radius:4px;background:#f6f7f7;text-align:center}.yxf-upload-box h2{margin:0 0 10px;font-size:20px}.yxf-upload-box p{color:#646970}.yxf-upload-box input[type=file]{display:block;max-width:100%;margin:22px auto}.yxf-upload-actions{display:flex;justify-content:center;gap:8px}.yxf-upload-queue{max-width:760px;margin:22px auto 0;padding:0;list-style:none;border-top:1px solid #dcdcde}.yxf-upload-queue:empty{display:none}.yxf-upload-item{display:flex;gap:12px;align-items:center;padding:12px 2px;border-bottom:1px solid #e5e5e5}.yxf-upload-item-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}.yxf-upload-item-status{font-size:12px;color:#646970}.yxf-upload-item.is-uploading .yxf-upload-item-status{color:#2271b1}.yxf-upload-item.is-success .yxf-upload-item-status{color:#00a32a}.yxf-upload-item.is-error .yxf-upload-item-status{color:#d63638}.yxf-upload-item-remove{color:#b32d2e;border:0;background:none;cursor:pointer}.yxf-uploaded-wrap{max-width:760px;margin:26px auto 0}.yxf-uploaded-wrap:empty{display:none}.yxf-uploaded-title{margin:0 0 10px;font-weight:600;text-align:left}.yxf-uploaded-thumbs{display:grid;grid-template-columns:repeat(auto-fill,minmax(92px,1fr));gap:10px}.yxf-uploaded-thumb{position:relative;display:block;aspect-ratio:1;padding:0;border:2px solid transparent;background:#f0f0f1;cursor:pointer;overflow:hidden}.yxf-uploaded-thumb:hover{border-color:#2271b1}.yxf-uploaded-thumb img{display:block;width:100%;height:100%;object-fit:cover}.yxf-uploaded-thumb span{position:absolute;inset:auto 0 0;padding:4px 5px;background:rgba(0,0,0,.62);color:#fff;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.yxf-library-panel{display:flex;flex-direction:column}.yxf-library-toolbar{display:flex;align-items:center;gap:10px;min-height:54px;padding:0 18px;border-bottom:1px solid #dcdcde;background:#f6f7f7}.yxf-library-toolbar select{min-width:128px}.yxf-library-toolbar input{margin-left:auto;width:260px;max-width:42%;height:30px}.yxf-library-main{display:flex;flex:1;min-height:0}.yxf-attachments{flex:1;display:grid;grid-template-columns:repeat(auto-fill,minmax(112px,1fr));align-content:start;gap:16px;margin:0;padding:20px;overflow:auto;list-style:none}.yxf-attachment{position:relative;aspect-ratio:1;border:1px solid #dcdcde;background:#f0f0f1;cursor:pointer;overflow:hidden}.yxf-attachment img{width:100%;height:100%;object-fit:cover;display:block}.yxf-file-icon{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#646970;font-size:12px;padding:12px;text-align:center;word-break:break-all}.yxf-file-icon b{font-size:28px;line-height:1;margin-bottom:10px;color:#2271b1}.yxf-attachment.is-selected{border:3px solid #2271b1}.yxf-attachment.is-selected:after{content:"✓";position:absolute;right:0;top:0;width:24px;height:24px;background:#2271b1;color:#fff;font-weight:700;text-align:center;line-height:24px}.yxf-empty{grid-column:1/-1;padding:70px 20px;text-align:center;color:#646970}.yxf-details{width:300px;box-sizing:border-box;padding:20px;border-left:1px solid #dcdcde;background:#fff;overflow:auto}.yxf-details.is-empty{color:#646970;padding-top:70px;text-align:center}.yxf-details img,.yxf-details video{width:100%;height:190px;object-fit:contain;background:#f0f0f1;margin-bottom:18px}.yxf-detail-title{margin:0 0 14px;font-size:15px;word-break:break-word}.yxf-detail-meta{margin:6px 0;color:#646970;font-size:12px;word-break:break-all}.yxf-detail-url{display:block;max-height:64px;overflow:auto;color:#2271b1;font-size:12px;word-break:break-all}.yxf-detail-actions{display:flex;gap:8px;margin-top:16px}.yxf-media-footer{display:flex;justify-content:flex-end;gap:8px;min-height:60px;padding:12px 18px;box-sizing:border-box;border-top:1px solid #dcdcde;background:#fff}.yxf-media-footer .button{height:32px}.yxf-notice{margin:16px 0}.yxf-hidden{display:none!important}@media(max-width:720px){.yxf-upload-panel{padding:20px}.yxf-details{width:240px}.yxf-library-toolbar input{width:160px}.yxf-attachments{grid-template-columns:repeat(auto-fill,minmax(88px,1fr));gap:10px;padding:12px}}
         </style>
         <div class="yxf-media-frame" id="yxf-media-frame">
             <div class="yxf-media-tabs" role="tablist" aria-label="游先锋图库">
@@ -1205,18 +1378,16 @@ final class YouXianFeng_Gallery {
             </div>
             <div class="yxf-media-body">
                 <section class="yxf-media-panel yxf-upload-panel <?php echo $active_tab === 'upload' ? 'is-active' : ''; ?>" data-yxf-panel="upload">
-                    <form class="yxf-upload-box" method="post" enctype="multipart/form-data" action="<?php echo esc_url($upload_action); ?>">
-                        <?php wp_nonce_field('yxf_gallery_upload'); ?>
-                        <input type="hidden" name="yxf_gallery_action" value="upload_image">
-                        <input type="hidden" name="yxf_gallery_context" value="iframe">
-                        <input type="hidden" name="post_id" value="<?php echo $post_id; ?>">
-                        <h2>上传媒体到游先锋图库</h2>
-                        <p>文件会保存到游先锋邮箱，并自动生成可用于文章和主题设置的公开链接。</p>
+                    <div class="yxf-upload-box">
+                        <h2>上传图片到游先锋图库</h2>
+                        <p>可一次选择多张图片。上传完成后，点击下方缩略图即可直接插入文章。</p>
                         <?php self::notices(); ?>
                         <?php if (!self::user_has_login()) : ?><div class="notice notice-warning inline"><p>请先在后台“游先锋图库 → 登录”中填写你自己的游先锋邮箱账号。</p></div><?php endif; ?>
-                        <input id="yxf-gallery-file" name="gallery_file" type="file" required <?php disabled(!self::user_has_login()); ?>>
-                        <button class="button button-primary button-large" type="submit" <?php disabled(!self::user_has_login()); ?>>上传媒体</button>
-                    </form>
+                        <input id="yxf-frame-files" type="file" accept="image/*" multiple class="yxf-hidden" <?php disabled(!self::user_has_login()); ?>>
+                        <p class="yxf-upload-actions"><button class="button button-large" type="button" id="yxf-frame-choose" <?php disabled(!self::user_has_login()); ?>>选择图片</button><button class="button button-primary button-large" type="button" id="yxf-frame-start" disabled>开始上传</button></p>
+                    </div>
+                    <ul class="yxf-upload-queue" id="yxf-frame-queue" aria-live="polite"></ul>
+                    <div class="yxf-uploaded-wrap" id="yxf-frame-uploaded" aria-live="polite"></div>
                 </section>
                 <section class="yxf-media-panel yxf-library-panel <?php echo $active_tab === 'library' ? 'is-active' : ''; ?>" data-yxf-panel="library">
                     <?php self::notices(); ?>
@@ -1247,6 +1418,16 @@ final class YouXianFeng_Gallery {
             var insert = document.getElementById('yxf-insert');
             var type = document.getElementById('yxf-type-filter');
             var search = document.getElementById('yxf-search');
+            var uploadInput = document.getElementById('yxf-frame-files');
+            var uploadChoose = document.getElementById('yxf-frame-choose');
+            var uploadStart = document.getElementById('yxf-frame-start');
+            var uploadQueue = document.getElementById('yxf-frame-queue');
+            var uploadedWrap = document.getElementById('yxf-frame-uploaded');
+            var uploadItems = new Map();
+            var uploadedItems = [];
+            var uploading = false;
+            var ajaxUrl = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
+            var uploadNonce = <?php echo wp_json_encode(wp_create_nonce('yxf_gallery_upload')); ?>;
             var close = function(){ if (window.parent && window.parent.YXFGalleryClose) window.parent.YXFGalleryClose(); else if (window.parent && window.parent.tb_remove) window.parent.tb_remove(); else if (window.tb_remove) window.tb_remove(); };
             var copy = function(value, button){
                 var done = function(){ var original = button.textContent; button.textContent = '已复制'; window.setTimeout(function(){ button.textContent = original; }, 1500); };
@@ -1256,6 +1437,72 @@ final class YouXianFeng_Gallery {
             var switchTab = function(tab){
                 frame.querySelectorAll('[data-yxf-tab]').forEach(function(button){ var selected = button.getAttribute('data-yxf-tab') === tab; button.classList.toggle('is-active', selected); button.setAttribute('aria-selected', selected ? 'true' : 'false'); });
                 frame.querySelectorAll('[data-yxf-panel]').forEach(function(panel){ panel.classList.toggle('is-active', panel.getAttribute('data-yxf-panel') === tab); });
+            };
+            var insertItems = function(chosen){
+                chosen = chosen || [];
+                if (!chosen.length) return;
+                if (callbackKey && window.parent && window.parent.YXFGalleryMediaCallbacks && typeof window.parent.YXFGalleryMediaCallbacks[callbackKey] === 'function') {
+                    window.parent.YXFGalleryMediaCallbacks[callbackKey](chosen);
+                    close();
+                    return;
+                }
+                var imageHtml = chosen.map(function(item){ if (item.kind === 'image') { var image = document.createElement('img'); image.src = item.url; image.alt = ''; return image.outerHTML; } return '<a href="' + item.url.replace(/"/g, '&quot;') + '">' + (item.name || item.url) + '</a>'; }).join('');
+                var editorWindow = window.parent && typeof window.parent.send_to_editor === 'function' ? window.parent : window;
+                if (typeof editorWindow.send_to_editor !== 'function') { window.alert('未找到文章编辑器，请关闭窗口后重试。'); return; }
+                editorWindow.send_to_editor(imageHtml);
+                close();
+            };
+            var uploadKey = function(file){ return [file.name, file.size, file.lastModified].join(':'); };
+            var renderUploadQueue = function(){
+                if (!uploadQueue || !uploadStart) return;
+                uploadQueue.innerHTML = '';
+                uploadItems.forEach(function(entry, id){
+                    var row = document.createElement('li'); row.className = 'yxf-upload-item is-' + entry.state;
+                    row.innerHTML = '<span class="yxf-upload-item-name"></span><span class="yxf-upload-item-status"></span>';
+                    row.querySelector('.yxf-upload-item-name').textContent = entry.file.name;
+                    row.querySelector('.yxf-upload-item-status').textContent = entry.message;
+                    if (entry.state === 'waiting' || entry.state === 'error') { var remove = document.createElement('button'); remove.type = 'button'; remove.className = 'yxf-upload-item-remove'; remove.textContent = '移除'; remove.addEventListener('click', function(){ uploadItems.delete(id); renderUploadQueue(); }); row.appendChild(remove); }
+                    uploadQueue.appendChild(row);
+                });
+                uploadStart.disabled = uploading || !Array.prototype.some.call(Array.from(uploadItems.values()), function(entry){ return entry.state === 'waiting' || entry.state === 'error'; });
+            };
+            var renderUploadedThumbs = function(){
+                if (!uploadedWrap) return;
+                uploadedWrap.innerHTML = '';
+                if (!uploadedItems.length) return;
+                var title = document.createElement('p'); title.className = 'yxf-uploaded-title'; title.textContent = '上传完成（点击缩略图直接插入）';
+                var grid = document.createElement('div'); grid.className = 'yxf-uploaded-thumbs';
+                uploadedItems.forEach(function(item){
+                    var button = document.createElement('button'); button.type = 'button'; button.className = 'yxf-uploaded-thumb'; button.title = '插入：' + item.name;
+                    var image = document.createElement('img'); image.src = item.url; image.alt = item.name; image.loading = 'lazy';
+                    var label = document.createElement('span'); label.textContent = item.name;
+                    button.append(image, label); button.addEventListener('click', function(){ insertItems([item]); }); grid.appendChild(button);
+                });
+                uploadedWrap.append(title, grid);
+            };
+            var addUploadFiles = function(files){
+                Array.prototype.forEach.call(files || [], function(file){ if (!file.type || !file.type.match(/^image\//)) return; var id = uploadKey(file); if (!uploadItems.has(id)) uploadItems.set(id, {file:file, state:'waiting', message:'等待上传'}); });
+                uploadInput.value = ''; renderUploadQueue();
+            };
+            var addUploadedItem = function(data){
+                if (!data || !data.url) return;
+                var item = {id:Number(data.id || 0), attachmentId:Number(data.attachmentId || 0), name:data.name || '图片', url:data.url, mime:data.mime || 'image/*', kind:data.kind || 'image', authorId:currentUser, createdAt:data.createdAt || ''};
+                if (!items.some(function(existing){ return existing.id === item.id; })) items.unshift(item);
+                if (!uploadedItems.some(function(existing){ return existing.id === item.id; })) uploadedItems.unshift(item);
+                render(); renderUploadedThumbs();
+            };
+            var uploadOne = async function(entry){
+                entry.state = 'uploading'; entry.message = '正在上传…'; renderUploadQueue();
+                var data = new FormData(); data.append('action', 'yxf_gallery_upload_image'); data.append('nonce', uploadNonce); data.append('gallery_file', entry.file, entry.file.name);
+                try { var response = await fetch(ajaxUrl, {method:'POST', body:data, credentials:'same-origin'}); var payload = await response.json(); if (!payload.success) throw new Error((payload.data && payload.data.message) || '上传失败，请重试。'); entry.state = 'success'; entry.message = payload.data.duplicate ? '已存在，无需重复上传' : (payload.data.warning ? '已上传，公开链接正在生成' : '上传完成'); addUploadedItem(payload.data); }
+                catch(error) { entry.state = 'error'; entry.message = error.message || '上传失败，请重试。'; }
+                renderUploadQueue();
+            };
+            var runUploadQueue = async function(){
+                if (uploading) return;
+                uploading = true; renderUploadQueue();
+                for (const entry of uploadItems.values()) if (entry.state === 'waiting' || entry.state === 'error') await uploadOne(entry);
+                uploading = false; renderUploadQueue();
             };
             var visibleItems = function(){
                 var keyword = (search.value || '').trim().toLowerCase();
@@ -1302,19 +1549,8 @@ final class YouXianFeng_Gallery {
             items.forEach(function(item){ if (item.mime && !Array.prototype.some.call(type.options, function(option){ return option.value === item.mime; })) { var option = document.createElement('option'); option.value = item.mime; option.textContent = item.mime.replace(/^.*\//, '').toUpperCase(); type.appendChild(option); } });
             type.addEventListener('change', render); search.addEventListener('input', render);
             document.getElementById('yxf-cancel').addEventListener('click', close);
-            insert.addEventListener('click', function(){
-                if (!active) return;
-                if (callbackKey && window.parent && window.parent.YXFGalleryMediaCallbacks && typeof window.parent.YXFGalleryMediaCallbacks[callbackKey] === 'function') {
-                    window.parent.YXFGalleryMediaCallbacks[callbackKey](selectedItems.length ? selectedItems : [active]);
-                    close();
-                    return;
-                }
-                var imageHtml = (selectedItems.length ? selectedItems : [active]).map(function(item){ if (item.kind === 'image') { var image = document.createElement('img'); image.src = item.url; image.alt = ''; return image.outerHTML; } return '<a href="' + item.url.replace(/"/g, '&quot;') + '">' + (item.name || item.url) + '</a>'; }).join('');
-                var editorWindow = window.parent && typeof window.parent.send_to_editor === 'function' ? window.parent : window;
-                if (typeof editorWindow.send_to_editor !== 'function') { window.alert('未找到文章编辑器，请关闭窗口后重试。'); return; }
-                editorWindow.send_to_editor(imageHtml);
-                close();
-            });
+            insert.addEventListener('click', function(){ if (active) insertItems(selectedItems.length ? selectedItems : [active]); });
+            if (uploadChoose && uploadInput && uploadStart) { uploadChoose.addEventListener('click', function(){ uploadInput.click(); }); uploadInput.addEventListener('change', function(){ addUploadFiles(uploadInput.files); }); uploadStart.addEventListener('click', runUploadQueue); renderUploadQueue(); }
             render();
         }());
         </script>
