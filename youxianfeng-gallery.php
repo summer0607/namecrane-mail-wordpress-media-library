@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 游先锋图库
  * Description: 将媒体上传至游先锋邮箱存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 0.5.5
+ * Version: 0.5.6
  * Update URI: https://github.com/summer0607/youxianfeng-gallery
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '0.5.5';
+    const VERSION = '0.5.6';
     const GITHUB_REPOSITORY = 'summer0607/youxianfeng-gallery';
     const RELEASE_ASSET = 'youxianfeng-gallery.zip';
     const UPDATE_CACHE_KEY = 'yxf_gallery_github_release';
@@ -467,10 +467,36 @@ final class YouXianFeng_Gallery {
         echo '<div class="notice notice-success is-dismissible"><p>游先锋图库已检查 GitHub 新版本。</p></div>';
     }
 
-    private static function storage_test($settings, $password) {
-        if (!function_exists('curl_init') || !defined('CURLOPT_PROTOCOLS_STR')) {
-            return new WP_Error('storage_unsupported', '当前网站环境不支持所选的文件存储协议。');
+    /**
+     * 为不同版本的 cURL 生成协议限制选项。
+     * CURLOPT_PROTOCOLS_STR 是较新的写法；部分服务器仍使用旧版 cURL，
+     * 此时可安全地回退至 CURLOPT_PROTOCOLS 位掩码。
+     */
+    private static function storage_protocol_options($protocol) {
+        if (!function_exists('curl_init') || !function_exists('curl_version')) {
+            return new WP_Error('storage_unsupported', '当前网站未启用文件存储所需的 cURL 扩展。');
         }
+
+        $protocol = $protocol === 'sftp' ? 'sftp' : 'ftp';
+        $curl_info = curl_version();
+        $supported = array_map('strtolower', (array) ($curl_info['protocols'] ?? array()));
+        if (!in_array($protocol, $supported, true)) {
+            return new WP_Error('storage_unsupported', '当前网站环境未启用 ' . strtoupper($protocol) . ' 文件存储协议。');
+        }
+
+        if (defined('CURLOPT_PROTOCOLS_STR')) {
+            return array(CURLOPT_PROTOCOLS_STR => $protocol);
+        }
+
+        $constant = $protocol === 'sftp' ? 'CURLPROTO_SFTP' : 'CURLPROTO_FTP';
+        if (defined('CURLOPT_PROTOCOLS') && defined($constant)) {
+            return array(CURLOPT_PROTOCOLS => constant($constant));
+        }
+
+        return new WP_Error('storage_unsupported', '当前网站的 cURL 版本过低，无法安全使用 ' . strtoupper($protocol) . ' 文件存储协议。');
+    }
+
+    private static function storage_test($settings, $password) {
         foreach (array('sftp_host' => '存储服务器', 'sftp_username' => '存储用户名', 'sftp_remote_path' => '目标目录') as $key => $label) {
             if (empty($settings[$key])) {
                 return new WP_Error('sftp_missing', '请填写' . $label . '。');
@@ -481,18 +507,21 @@ final class YouXianFeng_Gallery {
         }
         $protocol = $settings['storage_protocol'] === 'sftp' ? 'sftp' : 'ftp';
         $label = $protocol === 'sftp' ? 'SFTP' : 'FTPS';
+        $protocol_options = self::storage_protocol_options($protocol);
+        if (is_wp_error($protocol_options)) {
+            return $protocol_options;
+        }
         $curl = curl_init();
         $target = sprintf('%s://%s:%d%s', $protocol, $settings['sftp_host'], $settings['sftp_port'], rtrim($settings['sftp_remote_path'], '/') . '/');
-        curl_setopt_array($curl, array(
+        curl_setopt_array($curl, array_merge(array(
             CURLOPT_URL           => $target,
             CURLOPT_USERNAME      => $settings['sftp_username'],
             CURLOPT_PASSWORD      => $password,
             CURLOPT_CONNECTTIMEOUT=> 15,
             CURLOPT_TIMEOUT       => 40,
-            CURLOPT_PROTOCOLS_STR => $protocol,
             CURLOPT_DIRLISTONLY   => true,
             CURLOPT_WRITEFUNCTION => static function ($handle, $data) { return strlen($data); },
-        ));
+        ), $protocol_options));
         if ($protocol === 'sftp') {
             curl_setopt($curl, CURLOPT_SSH_AUTH_TYPES, CURLSSH_AUTH_PASSWORD);
         } else {
@@ -528,18 +557,22 @@ final class YouXianFeng_Gallery {
             return new WP_Error('local_file', '无法读取待上传的图片。');
         }
         $protocol = $settings['storage_protocol'] === 'sftp' ? 'sftp' : 'ftp';
+        $protocol_options = self::storage_protocol_options($protocol);
+        if (is_wp_error($protocol_options)) {
+            fclose($stream);
+            return $protocol_options;
+        }
         $curl = curl_init();
-        curl_setopt_array($curl, array(
+        curl_setopt_array($curl, array_merge(array(
             CURLOPT_URL            => self::storage_url($settings, $remote_file),
             CURLOPT_USERNAME       => $settings['sftp_username'],
             CURLOPT_PASSWORD       => $password,
             CURLOPT_CONNECTTIMEOUT => 15,
             CURLOPT_TIMEOUT        => 180,
-            CURLOPT_PROTOCOLS_STR  => $protocol,
             CURLOPT_UPLOAD         => true,
             CURLOPT_INFILE         => $stream,
             CURLOPT_INFILESIZE     => filesize($local_file),
-        ));
+        ), $protocol_options));
         if ($protocol === 'sftp') {
             curl_setopt($curl, CURLOPT_SSH_AUTH_TYPES, CURLSSH_AUTH_PASSWORD);
         } else {
@@ -558,18 +591,21 @@ final class YouXianFeng_Gallery {
             return new WP_Error('delete_credentials', '该图片缺少可用的邮箱登录信息或网盘路径，未执行删除。');
         }
         $protocol = $settings['storage_protocol'] === 'sftp' ? 'sftp' : 'ftp';
+        $protocol_options = self::storage_protocol_options($protocol);
+        if (is_wp_error($protocol_options)) {
+            return $protocol_options;
+        }
         $curl = curl_init();
-        curl_setopt_array($curl, array(
+        curl_setopt_array($curl, array_merge(array(
             CURLOPT_URL            => self::storage_path_url($settings, $remote_path),
             CURLOPT_USERNAME       => $settings['sftp_username'],
             CURLOPT_PASSWORD       => $password,
             // 每次仅删除一张图片；设置较短超时，避免邮箱服务异常拖垮后台页面。
             CURLOPT_CONNECTTIMEOUT => 5,
             CURLOPT_TIMEOUT        => 12,
-            CURLOPT_PROTOCOLS_STR  => $protocol,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_FAILONERROR    => true,
-        ));
+        ), $protocol_options));
         if ($protocol === 'sftp') {
             curl_setopt($curl, CURLOPT_SSH_AUTH_TYPES, CURLSSH_AUTH_PASSWORD);
             curl_setopt($curl, CURLOPT_NOBODY, true);
