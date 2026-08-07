@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 游先锋图库
  * Description: 将媒体上传至游先锋邮箱存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 0.5.16
+ * Version: 0.5.22
  * Update URI: https://github.com/summer0607/youxianfeng-gallery
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '0.5.16';
+    const VERSION = '0.5.22';
     const GITHUB_REPOSITORY = 'summer0607/youxianfeng-gallery';
     const RELEASE_ASSET = 'youxianfeng-gallery.zip';
     const UPDATE_CACHE_KEY = 'yxf_gallery_github_release';
@@ -656,6 +656,16 @@ final class YouXianFeng_Gallery {
         return $ok === false ? new WP_Error('remote_delete_failed', '邮箱网盘文件删除失败：' . $error) : true;
     }
 
+    /** 仅从图库移除记录，保留用户游先锋邮箱网盘中的原文件。 */
+    private static function remove_item_from_gallery($item) {
+        global $wpdb;
+        $wpdb->delete(self::table_name(), array('id' => (int) $item->id), array('%d'));
+        if (!empty($item->attachment_id)) {
+            wp_delete_attachment((int) $item->attachment_id, true);
+        }
+        return true;
+    }
+
     /** 远端文件先成功删除，才清理网站中的记录和虚拟媒体。 */
     private static function delete_item_with_remote_file($item) {
         list($settings, $password) = self::storage_settings_for_user((int) $item->author_id);
@@ -681,11 +691,7 @@ final class YouXianFeng_Gallery {
             return new WP_Error('remote_delete_unconfirmed', '邮箱网盘未确认删除该图片，已保留图库记录，请稍后重试。');
         }
         global $wpdb;
-        $wpdb->delete(self::table_name(), array('id' => (int) $item->id), array('%d'));
-        if (!empty($item->attachment_id)) {
-            wp_delete_attachment((int) $item->attachment_id, true);
-        }
-        return true;
+        return self::remove_item_from_gallery($item);
     }
 
     private static function api_request($settings, $token, $method, $path, $body = null) {
@@ -901,7 +907,7 @@ final class YouXianFeng_Gallery {
             self::redirect('yxf-gallery', 'uploaded');
         }
 
-        if ($action === 'delete_item') {
+        if ($action === 'remove_item' || $action === 'delete_item') {
             if (!self::can_use_gallery()) {
                 wp_die('无权删除图库图片。');
             }
@@ -914,13 +920,13 @@ final class YouXianFeng_Gallery {
                 if (!$owner_id || !self::can_delete_item($owner_id)) {
                     wp_die('无权删除其他用户上传的图片。');
                 }
-                $result = self::delete_item_with_remote_file($item);
+                $result = $action === 'remove_item' ? self::remove_item_from_gallery($item) : self::delete_item_with_remote_file($item);
                 if (is_wp_error($result)) {
                     set_transient('yxf_gallery_notice_' . get_current_user_id(), array('error', $result->get_error_message()), MINUTE_IN_SECONDS);
                     self::redirect(self::can_administer() ? 'yxf-gallery-manage' : 'yxf-gallery', 'stored_notice');
                 }
             }
-            self::redirect(self::can_administer() ? 'yxf-gallery-manage' : 'yxf-gallery', 'deleted');
+            self::redirect(self::can_administer() ? 'yxf-gallery-manage' : 'yxf-gallery', $action === 'remove_item' ? 'removed' : 'deleted');
         }
 
         if ($action === 'delete_items_remote') {
@@ -1210,7 +1216,8 @@ final class YouXianFeng_Gallery {
             'storage_unconfigured' => array('error', '请先在“登录”中保存自己的游先锋邮箱账号。'),
             'login_required' => array('error', '请先在“登录”中保存自己的游先锋邮箱账号和密码。'),
             'login_saved' => array('success', '你的游先锋邮箱登录信息已保存。'),
-            'deleted'        => array('success', '图库记录已删除；远端文件不会被删除。'),
+            'removed'        => array('success', '图片已移出图库，邮箱网盘中的原文件已保留。'),
+            'deleted'        => array('success', '图片及邮箱网盘中的原文件已彻底删除。'),
         );
         if (isset($messages[$notice])) {
             printf('<div class="notice notice-%1$s is-dismissible"><p>%2$s</p></div>', esc_attr($messages[$notice][0]), esc_html($messages[$notice][1]));
@@ -1226,8 +1233,22 @@ final class YouXianFeng_Gallery {
 
     private static function render_copy_script() {
         ?>
+        <style>
+            .yxf-gallery-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;max-width:1080px}.yxf-gallery-card{position:relative;min-width:0;width:auto!important;margin:0!important;padding:10px;overflow:visible}.yxf-gallery-thumb,.yxf-gallery-file{display:block;width:100%;height:110px;box-sizing:border-box;object-fit:cover;background:#f0f0f1}.yxf-gallery-file{display:flex;align-items:center;justify-content:center;color:#2271b1;text-align:center;text-decoration:none}.yxf-gallery-pending{color:#646970}.yxf-gallery-card-actions{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px}.yxf-gallery-delete-trigger{display:flex;align-items:center;justify-content:center;width:20px;height:20px;padding:0;border:0;background:transparent;cursor:pointer}.yxf-gallery-delete-trigger svg{display:block;width:16px;height:16px;fill:#bfbfbf}.yxf-gallery-delete-trigger:hover svg,.yxf-gallery-delete-trigger:focus svg{fill:#b32d2e}.yxf-gallery-copy-button{position:relative;padding:0;border:0;background:transparent;color:#2271b1;text-decoration:none;cursor:pointer}.yxf-gallery-copy-button:hover,.yxf-gallery-copy-button:focus{color:#135e96;text-decoration:none}.yxf-gallery-copy-button:after{content:attr(data-link);position:absolute;z-index:20;right:0;bottom:calc(100% + 8px);display:none;width:240px;max-width:calc(100vw - 40px);padding:7px 9px;border-radius:3px;background:rgba(0,0,0,.78);color:#fff;font-size:12px;font-weight:400;line-height:1.45;text-align:left;white-space:normal;word-break:break-all;box-shadow:0 2px 8px rgba(0,0,0,.2);pointer-events:none}.yxf-gallery-copy-button:hover:after,.yxf-gallery-copy-button:focus:after{display:block}.yxf-gallery-limit-note{max-width:1080px;margin:18px 0 0;padding:10px 12px;border-left:3px solid #72aee6;background:#f6f7f7;color:#50575e}.yxf-gallery-wrap #yxf-gallery-manage-form .yxf-gallery-limit-note{max-width:1280px}.yxf-gallery-delete-dialog{position:fixed;z-index:99999;inset:0}.yxf-gallery-delete-dialog-mask{position:absolute;inset:0;background:rgba(0,0,0,.32)}.yxf-gallery-delete-dialog-card{position:relative;z-index:1;width:min(360px,calc(100vw - 40px));margin:18vh auto 0;padding:20px;background:#fff;border-radius:4px;box-shadow:0 8px 24px rgba(0,0,0,.22)}.yxf-gallery-delete-dialog-card h2{margin:0 0 10px;font-size:18px}.yxf-gallery-delete-dialog-card p{margin:8px 0}.yxf-gallery-delete-dialog-card form{display:inline-block;margin:8px 8px 0 0}.yxf-gallery-delete-dialog-card .description{line-height:1.6}.yxf-gallery-delete-cancel{display:block;margin-top:12px}@media(max-width:782px){.yxf-gallery-grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}}
+        </style>
         <script>
         document.addEventListener('click', function(event) {
+            var deleteTrigger = event.target.closest('.yxf-gallery-delete-trigger');
+            if (deleteTrigger) {
+                var dialog = deleteTrigger.closest('.yxf-gallery-card').querySelector('.yxf-gallery-delete-dialog');
+                if (dialog) dialog.hidden = false;
+                return;
+            }
+            if (event.target.closest('[data-yxf-close-delete]')) {
+                var closeDialog = event.target.closest('.yxf-gallery-delete-dialog');
+                if (closeDialog) closeDialog.hidden = true;
+                return;
+            }
             var button = event.target.closest('.yxf-copy-link');
             if (!button) return;
             var value = button.getAttribute('data-copy-url') || '';
@@ -1235,6 +1256,7 @@ final class YouXianFeng_Gallery {
             if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(value).then(done); return; }
             var input = document.createElement('textarea'); input.value = value; input.style.position = 'fixed'; input.style.opacity = '0'; document.body.appendChild(input); input.select(); document.execCommand('copy'); input.remove(); done();
         });
+        document.addEventListener('keydown', function(event) { if (event.key !== 'Escape') return; document.querySelectorAll('.yxf-gallery-delete-dialog').forEach(function(item) { item.hidden = true; }); });
         </script>
         <?php
     }
@@ -1244,7 +1266,12 @@ final class YouXianFeng_Gallery {
             wp_die('无权访问图库。');
         }
         global $wpdb;
-        $items = $wpdb->get_results($wpdb->prepare("SELECT * FROM " . self::table_name() . " WHERE author_id = %d ORDER BY id DESC LIMIT 100", get_current_user_id()));
+        $item_total = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM " . self::table_name() . " WHERE author_id = %d", get_current_user_id()));
+        $per_page = 100;
+        $current_page = max(1, absint($_GET['paged'] ?? 1));
+        $total_pages = max(1, (int) ceil($item_total / $per_page));
+        $current_page = min($current_page, $total_pages);
+        $items = $wpdb->get_results($wpdb->prepare("SELECT * FROM " . self::table_name() . " WHERE author_id = %d ORDER BY id DESC LIMIT %d OFFSET %d", get_current_user_id(), $per_page, ($current_page - 1) * $per_page));
         $account = self::account();
         ?>
         <div class="wrap yxf-gallery-wrap">
@@ -1255,17 +1282,31 @@ final class YouXianFeng_Gallery {
             <?php if (!$items) : ?>
                 <div class="notice notice-info inline"><p>图库暂无媒体文件。请先上传一个文件。</p></div>
             <?php else : ?>
-                <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:16px;max-width:1180px">
+                <div class="yxf-gallery-grid">
                     <?php foreach ($items as $item) : ?>
                         <?php $item_url = $item->status === 'ready' ? self::item_public_url($item) : ''; ?>
-                        <article class="card" style="padding:10px;overflow:hidden">
-                            <?php if ($item->status === 'ready' && strpos((string) $item->mime_type, 'image/') === 0) : ?><img src="<?php echo esc_url($item_url); ?>" alt="" loading="lazy" decoding="async" style="display:block;width:100%;height:140px;object-fit:cover;background:#f0f0f1"><?php elseif ($item->status === 'ready') : ?><a href="<?php echo esc_url($item_url); ?>" target="_blank" rel="noopener" style="height:140px;display:flex;align-items:center;justify-content:center;background:#f6f7f7;color:#2271b1;text-decoration:none">媒体文件<br><?php echo esc_html(strtoupper((string) $item->mime_type)); ?></a><?php else : ?><div style="height:140px;display:flex;align-items:center;justify-content:center;background:#f6f7f7;color:#646970">等待公开链接</div><?php endif; ?>
+                        <article class="card yxf-gallery-card">
+                            <?php if ($item->status === 'ready' && strpos((string) $item->mime_type, 'image/') === 0) : ?><img class="yxf-gallery-thumb" src="<?php echo esc_url($item_url); ?>" alt="" loading="lazy" decoding="async"><?php elseif ($item->status === 'ready') : ?><a class="yxf-gallery-file" href="<?php echo esc_url($item_url); ?>" target="_blank" rel="noopener">媒体文件<br><?php echo esc_html(strtoupper((string) $item->mime_type)); ?></a><?php else : ?><div class="yxf-gallery-file yxf-gallery-pending">等待公开链接</div><?php endif; ?>
                             <p style="margin:10px 0 6px;word-break:break-all"><strong><?php echo esc_html($item->file_name ?: '图片'); ?></strong><br><small><?php echo esc_html($item->mime_type); ?></small></p>
-                            <p style="margin:0;display:flex;gap:6px"><input class="widefat" type="text" readonly value="<?php echo esc_attr($item->status === 'ready' ? $item_url : '公开链接待生成'); ?>"><?php if ($item->status === 'ready') : ?><button class="button yxf-copy-link" type="button" data-copy-url="<?php echo esc_attr($item_url); ?>">复制链接</button><?php endif; ?></p>
-                            <form method="post" style="margin-top:10px" onsubmit="return confirm('将永久删除此图片的邮箱网盘原文件和图库记录，无法恢复。确定继续吗？');"><?php wp_nonce_field('yxf_gallery_delete'); ?><input type="hidden" name="yxf_gallery_action" value="delete_item"><input type="hidden" name="item_id" value="<?php echo absint($item->id); ?>"><button class="button button-small button-link-delete">删除图片</button></form>
+                            <div class="yxf-gallery-card-actions">
+                                <button class="yxf-gallery-delete-trigger" type="button" title="删除文件" aria-label="删除文件"><svg viewBox="0 0 1024 1024" aria-hidden="true"><path d="M256 333.872a28.8 28.8 0 0 1 28.8 28.8V768a56.528 56.528 0 0 0 56.544 56.528h341.328A56.528 56.528 0 0 0 739.2 768V362.672a28.8 28.8 0 0 1 57.6 0V768a114.128 114.128 0 0 1-114.128 114.128H341.328A114.128 114.128 0 0 1 227.2 768V362.672a28.8 28.8 0 0 1 28.8-28.8zM405.344 269.648a28.8 28.8 0 0 0 28.8-28.8 56.528 56.528 0 0 1 56.528-56.544h42.656a56.528 56.528 0 0 1 56.544 56.544 28.8 28.8 0 0 0 57.6 0 114.128 114.128 0 0 0-112.64-114.128h-45.648a114.144 114.144 0 0 0-112.64 114.128 28.8 28.8 0 0 0 28.8 28.8zM163.2 266.672a28.8 28.8 0 0 1 28.8-28.8h640a28.8 28.8 0 0 1 0 57.6H192a28.8 28.8 0 0 1-28.8-28.8z"/><path d="M426.672 371.2a28.8 28.8 0 0 1 28.8 28.8v320a28.8 28.8 0 0 1-57.6 0V400a28.8 28.8 0 0 1 28.8-28.8zM597.344 371.2a28.8 28.8 0 0 1 28.8 28.8v320a28.8 28.8 0 0 1-57.6 0V400a28.8 28.8 0 0 1 28.8-28.8z"/></svg></button>
+                                <?php if ($item->status === 'ready') : ?><button class="yxf-gallery-copy-button yxf-copy-link" type="button" data-copy-url="<?php echo esc_attr($item_url); ?>" data-link="<?php echo esc_attr($item_url); ?>">复制链接</button><?php endif; ?>
+                            </div>
+                            <div class="yxf-gallery-delete-dialog" hidden role="dialog" aria-modal="true" aria-label="删除文件">
+                                <div class="yxf-gallery-delete-dialog-mask" data-yxf-close-delete></div>
+                                <div class="yxf-gallery-delete-dialog-card">
+                                    <h2>删除文件</h2>
+                                    <p>请选择删除方式：</p>
+                                    <form method="post"><?php wp_nonce_field('yxf_gallery_delete'); ?><input type="hidden" name="yxf_gallery_action" value="remove_item"><input type="hidden" name="item_id" value="<?php echo absint($item->id); ?>"><button class="button" type="submit">仅移出图库列表</button></form>
+                                    <form method="post"><?php wp_nonce_field('yxf_gallery_delete'); ?><input type="hidden" name="yxf_gallery_action" value="delete_item"><input type="hidden" name="item_id" value="<?php echo absint($item->id); ?>"><button class="button button-link-delete" type="submit">彻底删除</button></form>
+                                    <p class="description">仅移出图库列表会保留邮箱网盘文件；彻底删除会同时删除邮箱网盘中的文件，且无法恢复。</p>
+                                    <button class="button-link yxf-gallery-delete-cancel" type="button" data-yxf-close-delete>取消</button>
+                                </div>
+                            </div>
                         </article>
                     <?php endforeach; ?>
                 </div>
+                <?php if ($total_pages > 1) : ?><div class="tablenav yxf-gallery-pagination"><div class="tablenav-pages"><?php echo paginate_links(array('base' => add_query_arg('paged', '%#%', admin_url('admin.php?page=yxf-gallery')), 'format' => '', 'current' => $current_page, 'total' => $total_pages, 'prev_text' => '‹', 'next_text' => '›')); ?></div></div><?php endif; ?>
             <?php endif; ?>
         </div>
         <?php self::render_copy_script();
@@ -1285,20 +1326,22 @@ final class YouXianFeng_Gallery {
                 <input id="yxf-gallery-files" type="file" accept="image/*" multiple class="screen-reader-text" <?php disabled(!self::user_has_login()); ?>>
                 <p class="yxf-upload-actions"><button type="button" class="button" id="yxf-gallery-choose" <?php disabled(!self::user_has_login()); ?>>选择图片</button> <button type="button" class="button button-primary" id="yxf-gallery-start" disabled>开始上传</button></p>
                 <ul class="yxf-upload-queue" id="yxf-gallery-queue" aria-live="polite"></ul>
+                <div class="yxf-upload-links" id="yxf-gallery-links" aria-live="polite"></div>
             </div>
         </div>
         <style>
-            .yxf-upload-actions{display:flex;gap:8px;align-items:center}.yxf-upload-queue{margin:20px 0 0;border-top:1px solid #dcdcde}.yxf-upload-queue:empty{display:none}.yxf-upload-item{display:flex;gap:12px;align-items:center;padding:12px 2px;border-bottom:1px solid #f0f0f1}.yxf-upload-item-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.yxf-upload-item-status{font-size:12px;color:#646970}.yxf-upload-item.is-uploading .yxf-upload-item-status{color:#2271b1}.yxf-upload-item.is-success .yxf-upload-item-status{color:#00a32a}.yxf-upload-item.is-error .yxf-upload-item-status{color:#d63638}.yxf-upload-item-remove{color:#b32d2e;border:0;background:none;cursor:pointer}
+            .yxf-upload-actions{display:flex;gap:8px;align-items:center}.yxf-upload-queue{margin:20px 0 0;border-top:1px solid #dcdcde}.yxf-upload-queue:empty{display:none}.yxf-upload-item{display:flex;gap:12px;align-items:center;padding:12px 2px;border-bottom:1px solid #f0f0f1}.yxf-upload-item-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.yxf-upload-item-status{font-size:12px;color:#646970}.yxf-upload-item.is-uploading .yxf-upload-item-status{color:#2271b1}.yxf-upload-item.is-success .yxf-upload-item-status{color:#00a32a}.yxf-upload-item.is-error .yxf-upload-item-status{color:#d63638}.yxf-upload-item-remove{color:#b32d2e;border:0;background:none;cursor:pointer}.yxf-upload-links{margin-top:20px}.yxf-upload-links:empty{display:none}.yxf-upload-links-title{margin:0 0 8px;font-weight:600}.yxf-upload-link-row{display:flex;align-items:center;gap:8px;padding:10px 0;border-top:1px solid #f0f0f1}.yxf-upload-link-name{flex:0 0 150px;max-width:28%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.yxf-upload-link-url{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#2271b1;text-decoration:none}.yxf-upload-copy{flex:0 0 auto;width:28px;height:28px;padding:0;border:0;background:transparent;color:#2271b1;cursor:pointer}.yxf-upload-copy:hover{color:#135e96}.yxf-upload-copy:focus{outline:2px solid #72aee6;outline-offset:1px}@media(max-width:782px){.yxf-upload-link-row{flex-wrap:wrap}.yxf-upload-link-name{flex-basis:100%;max-width:100%}.yxf-upload-link-url{flex-basis:calc(100% - 40px)}}
         </style>
         <script>
         (function(){
-            var input=document.getElementById('yxf-gallery-files'), choose=document.getElementById('yxf-gallery-choose'), start=document.getElementById('yxf-gallery-start'), list=document.getElementById('yxf-gallery-queue');
-            if(!input||!choose||!start||!list){return;}
+            var input=document.getElementById('yxf-gallery-files'), choose=document.getElementById('yxf-gallery-choose'), start=document.getElementById('yxf-gallery-start'), list=document.getElementById('yxf-gallery-queue'), links=document.getElementById('yxf-gallery-links');
+            if(!input||!choose||!start||!list||!links){return;}
             var queue=new Map(), uploading=false, ajaxUrl=<?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>, nonce=<?php echo wp_json_encode(wp_create_nonce('yxf_gallery_upload')); ?>;
             function key(file){return [file.name,file.size,file.lastModified].join(':');}
-            function render(){list.innerHTML='';queue.forEach(function(item,id){var row=document.createElement('li');row.className='yxf-upload-item is-'+item.state;row.innerHTML='<span class="yxf-upload-item-name"></span><span class="yxf-upload-item-status"></span>';row.querySelector('.yxf-upload-item-name').textContent=item.file.name;row.querySelector('.yxf-upload-item-status').textContent=item.message;if(item.state==='waiting'||item.state==='error'){var remove=document.createElement('button');remove.type='button';remove.className='yxf-upload-item-remove';remove.textContent='移除';remove.addEventListener('click',function(){queue.delete(id);render();});row.appendChild(remove);}list.appendChild(row);});start.disabled=uploading||![...queue.values()].some(function(item){return item.state==='waiting'||item.state==='error';});}
+            function copy(url,button){var done=function(){button.title='已复制';window.setTimeout(function(){button.title='复制链接';},1500);};if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(url).then(done).catch(function(){window.prompt('请复制图片链接：',url);});}else{window.prompt('请复制图片链接：',url);}}
+            function render(){list.innerHTML='';links.innerHTML='';var completed=[];queue.forEach(function(item,id){var row=document.createElement('li');row.className='yxf-upload-item is-'+item.state;row.innerHTML='<span class="yxf-upload-item-name"></span><span class="yxf-upload-item-status"></span>';row.querySelector('.yxf-upload-item-name').textContent=item.file.name;row.querySelector('.yxf-upload-item-status').textContent=item.message;if(item.state==='waiting'||item.state==='error'){var remove=document.createElement('button');remove.type='button';remove.className='yxf-upload-item-remove';remove.textContent='移除';remove.addEventListener('click',function(){queue.delete(id);render();});row.appendChild(remove);}if(item.state==='success'&&item.url){completed.push(item);}list.appendChild(row);});if(completed.length){var title=document.createElement('p');title.className='yxf-upload-links-title';title.textContent='图片外部链接';links.appendChild(title);completed.forEach(function(item){var row=document.createElement('div');row.className='yxf-upload-link-row';var name=document.createElement('strong');name.className='yxf-upload-link-name';name.title=item.file.name;name.textContent=item.file.name;var url=document.createElement('a');url.className='yxf-upload-link-url';url.href=item.url;url.target='_blank';url.rel='noopener';url.title=item.url;url.textContent=item.url;var copyButton=document.createElement('button');copyButton.type='button';copyButton.className='yxf-upload-copy dashicons dashicons-admin-page';copyButton.title='复制链接';copyButton.setAttribute('aria-label','复制链接');copyButton.addEventListener('click',function(){copy(item.url,copyButton);});row.append(name,url,copyButton);links.appendChild(row);});}start.disabled=uploading||![...queue.values()].some(function(item){return item.state==='waiting'||item.state==='error';});}
             function add(files){Array.prototype.forEach.call(files,function(file){if(!file.type.match(/^image\//)){return;}var id=key(file);if(!queue.has(id)){queue.set(id,{file:file,state:'waiting',message:'等待上传'});}});input.value='';render();}
-            async function send(item){item.state='uploading';item.message='正在上传…';render();var data=new FormData();data.append('action','yxf_gallery_upload_image');data.append('nonce',nonce);data.append('gallery_file',item.file,item.file.name);try{var response=await fetch(ajaxUrl,{method:'POST',body:data,credentials:'same-origin'}),raw=await response.text(),payload;try{payload=JSON.parse(raw);}catch(parseError){throw new Error('服务器未返回有效的上传结果，请重新登录游先锋邮箱后再试。');}if(!payload.success){throw new Error((payload.data&&payload.data.message)||'上传失败，请重试。');}item.state='success';item.message=payload.data.duplicate?'已存在，无需重复上传':(payload.data.warning?'已上传，公开链接正在生成':'上传完成');}catch(error){item.state='error';item.message=error.message||'上传失败，请重试。';}render();}
+            async function send(item){item.state='uploading';item.message='正在上传…';render();var data=new FormData();data.append('action','yxf_gallery_upload_image');data.append('nonce',nonce);data.append('gallery_file',item.file,item.file.name);try{var response=await fetch(ajaxUrl,{method:'POST',body:data,credentials:'same-origin'}),raw=await response.text(),payload;try{payload=JSON.parse(raw);}catch(parseError){throw new Error('服务器未返回有效的上传结果，请重新登录游先锋邮箱后再试。');}if(!payload.success){throw new Error((payload.data&&payload.data.message)||'上传失败，请重试。');}item.url=(payload.data&&payload.data.url)||'';item.state='success';item.message=item.url?(payload.data.duplicate?'已存在，无需重复上传':'上传完成'):(payload.data.warning||'已上传，公开链接正在生成');}catch(error){item.state='error';item.message=error.message||'上传失败，请重试。';}render();}
             async function run(){if(uploading){return;}uploading=true;render();for(const item of queue.values()){if(item.state==='waiting'||item.state==='error'){await send(item);}}uploading=false;render();}
             choose.addEventListener('click',function(){input.click();});input.addEventListener('change',function(){add(input.files);});start.addEventListener('click',run);render();
         }());
@@ -1333,31 +1376,111 @@ final class YouXianFeng_Gallery {
             wp_die('无权管理图片。');
         }
         global $wpdb;
-        $items = $wpdb->get_results("SELECT i.*, u.display_name, u.user_login FROM " . self::table_name() . " i LEFT JOIN {$wpdb->users} u ON i.author_id = u.ID ORDER BY i.id DESC LIMIT 500");
+        $filter_month = preg_match('/^\d{4}-\d{2}$/', (string) ($_GET['yxf_gallery_month'] ?? '')) ? (string) $_GET['yxf_gallery_month'] : '';
+        $filter_author = absint($_GET['yxf_gallery_author'] ?? 0);
+        $filter_type = sanitize_text_field($_GET['yxf_gallery_type'] ?? '');
+        $where = array('1=1');
+        $where_args = array();
+        if ($filter_month !== '') {
+            $where[] = "DATE_FORMAT(i.created_at, '%%Y-%%m') = %s";
+            $where_args[] = $filter_month;
+        }
+        if ($filter_author) {
+            $where[] = 'i.author_id = %d';
+            $where_args[] = $filter_author;
+        }
+        if ($filter_type !== '') {
+            $where[] = 'i.mime_type = %s';
+            $where_args[] = $filter_type;
+        }
+        $where_sql = implode(' AND ', $where);
+        $base_from = " FROM " . self::table_name() . " i LEFT JOIN {$wpdb->users} u ON i.author_id = u.ID WHERE " . $where_sql;
+        $count_sql = 'SELECT COUNT(*)' . $base_from;
+        $item_total = (int) ($where_args ? $wpdb->get_var($wpdb->prepare($count_sql, $where_args)) : $wpdb->get_var($count_sql));
+        $allowed_per_page = array(10, 20, 50, 100);
+        $per_page = absint($_GET['yxf_gallery_per_page'] ?? 20);
+        if (!in_array($per_page, $allowed_per_page, true)) {
+            $per_page = 20;
+        }
+        $current_page = max(1, absint($_GET['paged'] ?? 1));
+        $total_pages = max(1, (int) ceil($item_total / $per_page));
+        $current_page = min($current_page, $total_pages);
+        $items_sql = 'SELECT i.*, u.display_name, u.user_login' . $base_from . ' ORDER BY i.id DESC LIMIT %d OFFSET %d';
+        $items = $wpdb->get_results($wpdb->prepare($items_sql, array_merge($where_args, array($per_page, ($current_page - 1) * $per_page))));
+        $months = $wpdb->get_col("SELECT DISTINCT DATE_FORMAT(created_at, '%Y-%m') FROM " . self::table_name() . " WHERE created_at IS NOT NULL AND created_at <> '' ORDER BY created_at DESC");
+        $authors = $wpdb->get_results("SELECT DISTINCT i.author_id, u.display_name, u.user_login FROM " . self::table_name() . " i LEFT JOIN {$wpdb->users} u ON i.author_id = u.ID ORDER BY u.display_name, u.user_login");
+        $types = $wpdb->get_col("SELECT DISTINCT mime_type FROM " . self::table_name() . " WHERE mime_type IS NOT NULL AND mime_type <> '' ORDER BY mime_type");
+        $pagination_filters = array_filter(array('yxf_gallery_month' => $filter_month, 'yxf_gallery_author' => $filter_author, 'yxf_gallery_type' => $filter_type, 'yxf_gallery_per_page' => $per_page));
+        $render_pagination = static function () use ($total_pages, $current_page, $item_total, $pagination_filters) {
+            ?>
+            <div class="tablenav-pages">
+                <span class="displaying-num"><?php echo esc_html($item_total); ?> 个项目</span>
+                <?php echo paginate_links(array('base' => add_query_arg(array_merge(array('page' => 'yxf-gallery-manage', 'paged' => '%#%'), $pagination_filters), admin_url('admin.php')), 'format' => '', 'current' => $current_page, 'total' => $total_pages, 'prev_text' => '‹', 'next_text' => '›')); ?>
+            </div>
+            <?php
+        };
         ?>
         <div class="wrap yxf-gallery-wrap">
             <h1>管理图片</h1>
             <?php self::notices(); ?>
             <p class="description">这里可查看所有用户上传的图片。删除时会同时删除对应用户游先锋邮箱网盘中的原文件和网站图库记录。</p>
+            <style>
+                .yxf-gallery-manage-table-wrap{width:100%;overflow-x:auto}.yxf-gallery-manage-table{width:100%;min-width:900px}.yxf-gallery-manage-table th,.yxf-gallery-manage-table td{vertical-align:middle}.yxf-gallery-manage-table .check-column{width:2.2em}.yxf-manage-thumb{width:64px}.yxf-manage-thumb img{display:block;width:52px;height:52px;object-fit:cover;background:#f0f0f1}.yxf-manage-image-preview{display:block;padding:0;border:0;background:transparent;cursor:zoom-in}.yxf-manage-name{min-width:180px;word-break:break-word}.yxf-manage-actions{width:130px;white-space:nowrap}.yxf-manage-actions button{margin:0 8px 0 0;padding:0;border:0;background:transparent;cursor:pointer}.yxf-manage-actions .button-link-delete{color:#b32d2e}.yxf-manage-actions .button-link-delete:hover{color:#8a2424}.yxf-manage-actions .button-link{color:#2271b1}.yxf-manage-actions .button-link:hover{color:#135e96}.yxf-gallery-manage-topbar{display:flex;align-items:center;justify-content:space-between;gap:12px}.yxf-gallery-manage-topbar .alignleft{display:flex;align-items:center;gap:6px;min-width:0}.yxf-gallery-manage-filter{display:flex;align-items:center;gap:6px;margin:0 0 0 8px}.yxf-gallery-manage-filter select[name="yxf_gallery_month"]{width:108px}.yxf-gallery-manage-filter select[name="yxf_gallery_author"]{width:132px}.yxf-gallery-manage-filter select[name="yxf_gallery_type"]{width:106px}.yxf-gallery-manage-filter select[name="yxf_gallery_per_page"]{width:86px}.yxf-gallery-manage-topbar .tablenav-pages{margin-left:auto;white-space:nowrap}.yxf-gallery-manage-bottom{margin-top:12px}.yxf-gallery-manage-bottom .alignleft{display:flex;align-items:center;gap:6px}.yxf-gallery-manage-topbar .tablenav-pages,.yxf-gallery-manage-bottom .tablenav-pages{margin-left:auto}.yxf-manage-preview-dialog{position:fixed;z-index:100000;inset:0}.yxf-manage-preview-mask{position:absolute;inset:0;background:rgba(0,0,0,.7)}.yxf-manage-preview-card{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;width:min(960px,calc(100vw - 48px));max-height:calc(100vh - 48px);margin:24px auto;padding:16px;background:#fff;border-radius:4px;box-shadow:0 8px 30px rgba(0,0,0,.35)}.yxf-manage-preview-card img{display:block;max-width:100%;max-height:calc(100vh - 118px);object-fit:contain}.yxf-manage-preview-card p{margin:10px 36px 0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.yxf-manage-preview-close{position:absolute;top:7px;right:9px;width:28px;height:28px;padding:0;border:0;background:transparent;color:#50575e;font-size:26px;line-height:28px;cursor:pointer}.yxf-manage-preview-close:hover{color:#1d2327}
+            </style>
             <?php if (!$items) : ?><div class="notice notice-info inline"><p>暂无用户上传图片。</p></div><?php else : ?>
+                <div class="tablenav top yxf-gallery-manage-topbar">
+                    <div class="alignleft actions">
+                        <select class="yxf-gallery-bulk-action"><option value="">批量操作</option><option value="delete">彻底删除</option></select><button type="button" class="button action yxf-gallery-delete-selected">应用</button><span class="description yxf-gallery-selected-count">未选择图片</span>
+                        <form method="get" class="yxf-gallery-manage-filter"><input type="hidden" name="page" value="yxf-gallery-manage"><select name="yxf_gallery_month"><option value="">全部月份</option><?php foreach ($months as $month) : ?><option value="<?php echo esc_attr($month); ?>" <?php selected($filter_month, $month); ?>><?php echo esc_html($month); ?></option><?php endforeach; ?></select><select name="yxf_gallery_author"><option value="0">全部上传者</option><?php foreach ($authors as $author) : ?><option value="<?php echo absint($author->author_id); ?>" <?php selected($filter_author, (int) $author->author_id); ?>><?php echo esc_html($author->display_name ?: $author->user_login ?: ('用户 #' . $author->author_id)); ?></option><?php endforeach; ?></select><select name="yxf_gallery_type"><option value="">全部类型</option><?php foreach ($types as $type) : ?><option value="<?php echo esc_attr($type); ?>" <?php selected($filter_type, $type); ?>><?php echo esc_html($type); ?></option><?php endforeach; ?></select><select name="yxf_gallery_per_page"><option value="10" <?php selected($per_page, 10); ?>>10 条/页</option><option value="20" <?php selected($per_page, 20); ?>>20 条/页</option><option value="50" <?php selected($per_page, 50); ?>>50 条/页</option><option value="100" <?php selected($per_page, 100); ?>>100 条/页</option></select><button class="button" type="submit">筛选</button></form>
+                    </div>
+                    <?php $render_pagination(); ?>
+                </div>
                 <form method="post" id="yxf-gallery-manage-form" data-ajax-url="<?php echo esc_url(admin_url('admin-ajax.php')); ?>" data-nonce="<?php echo esc_attr(wp_create_nonce('yxf_gallery_delete_remote')); ?>">
                     <?php wp_nonce_field('yxf_gallery_delete_remote'); ?>
                     <input type="hidden" name="yxf_gallery_action" value="delete_items_remote">
-                    <p style="display:flex;align-items:center;gap:10px;margin:16px 0"><button type="button" class="button" id="yxf-gallery-select-all">全选</button><button type="button" class="button button-primary" id="yxf-gallery-delete-selected">删除选中图片及网盘文件</button><span class="description" id="yxf-gallery-selected-count">未选择图片</span></p>
-                    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:16px;max-width:1280px">
-                        <?php foreach ($items as $item) : ?>
-                            <?php $item_url = $item->status === 'ready' ? self::item_public_url($item) : ''; ?>
-                            <article class="card yxf-gallery-manage-item" data-item-id="<?php echo absint($item->id); ?>" style="position:relative;padding:10px;overflow:hidden">
-                                <label style="position:absolute;z-index:2;top:16px;left:16px;display:flex;align-items:center;justify-content:center;width:28px;height:28px;background:#fff;border-radius:50%;box-shadow:0 1px 3px rgba(0,0,0,.22)"><input class="yxf-gallery-item-check" type="checkbox" name="item_ids[]" value="<?php echo absint($item->id); ?>" aria-label="选择 <?php echo esc_attr($item->file_name ?: '图片'); ?>"></label>
-                                <?php if ($item->status === 'ready' && strpos((string) $item->mime_type, 'image/') === 0) : ?><img src="<?php echo esc_url($item_url); ?>" alt="" loading="lazy" decoding="async" style="display:block;width:100%;height:140px;object-fit:cover;background:#f0f0f1"><?php elseif ($item->status === 'ready') : ?><a href="<?php echo esc_url($item_url); ?>" target="_blank" rel="noopener" style="height:140px;display:flex;align-items:center;justify-content:center;background:#f6f7f7;color:#2271b1;text-decoration:none">媒体文件<br><?php echo esc_html(strtoupper((string) $item->mime_type)); ?></a><?php else : ?><div style="height:140px;display:flex;align-items:center;justify-content:center;background:#f6f7f7;color:#646970">等待公开链接</div><?php endif; ?>
-                                <p style="margin:10px 0 6px;word-break:break-all"><strong><?php echo esc_html($item->file_name ?: '图片'); ?></strong><br><small>上传用户：<?php echo esc_html($item->display_name ?: $item->user_login ?: ('用户 #' . $item->author_id)); ?></small></p>
-                                <p style="margin:0;display:flex;gap:6px"><input class="widefat" type="text" readonly value="<?php echo esc_attr($item->status === 'ready' ? $item_url : '公开链接待生成'); ?>"><?php if ($item->status === 'ready') : ?><button class="button yxf-copy-link" type="button" data-copy-url="<?php echo esc_attr($item_url); ?>">复制链接</button><?php endif; ?></p>
-                            </article>
-                        <?php endforeach; ?>
+                    <div class="yxf-gallery-manage-table-wrap">
+                        <table class="widefat fixed striped yxf-gallery-manage-table">
+                            <thead><tr><td class="check-column"><input class="yxf-gallery-select-all-table" type="checkbox" aria-label="全选图片"></td><th scope="col">缩略图</th><th scope="col">文件名</th><th scope="col">文件类型</th><th scope="col">上传用户</th><th scope="col">上传时间</th><th scope="col">操作</th></tr></thead>
+                            <tbody>
+                                <?php foreach ($items as $item) : ?>
+                                    <?php $item_url = $item->status === 'ready' ? self::item_public_url($item) : ''; ?>
+                                    <tr class="yxf-gallery-manage-item" data-item-id="<?php echo absint($item->id); ?>">
+                                        <th scope="row" class="check-column"><input class="yxf-gallery-item-check" type="checkbox" name="item_ids[]" value="<?php echo absint($item->id); ?>" aria-label="选择 <?php echo esc_attr($item->file_name ?: '图片'); ?>"></th>
+                                        <td class="yxf-manage-thumb"><?php if ($item->status === 'ready' && strpos((string) $item->mime_type, 'image/') === 0) : ?><button class="yxf-manage-image-preview" type="button" data-image-url="<?php echo esc_attr($item_url); ?>" data-image-name="<?php echo esc_attr($item->file_name ?: '图片'); ?>"><img src="<?php echo esc_url($item_url); ?>" alt="<?php echo esc_attr($item->file_name ?: '图片'); ?>" loading="lazy" decoding="async"></button><?php elseif ($item->status === 'ready') : ?><a href="<?php echo esc_url($item_url); ?>" target="_blank" rel="noopener">文件</a><?php else : ?><span>待生成</span><?php endif; ?></td>
+                                        <td class="yxf-manage-name"><strong><?php echo esc_html($item->file_name ?: '图片'); ?></strong></td>
+                                        <td><code><?php echo esc_html($item->mime_type ?: '—'); ?></code></td>
+                                        <td><?php echo esc_html($item->display_name ?: $item->user_login ?: ('用户 #' . $item->author_id)); ?></td>
+                                        <td><?php echo esc_html($item->created_at ?: '—'); ?></td>
+                                        <td class="yxf-manage-actions"><button type="button" class="button-link-delete yxf-manage-delete-item">删除</button><?php if ($item->status === 'ready') : ?> <button type="button" class="button-link yxf-copy-link" data-copy-url="<?php echo esc_attr($item_url); ?>">复制链接</button><?php endif; ?></td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                            <tfoot><tr><td class="check-column"><input class="yxf-gallery-select-all-table" type="checkbox" aria-label="全选图片"></td><th scope="col">缩略图</th><th scope="col">文件名</th><th scope="col">文件类型</th><th scope="col">上传用户</th><th scope="col">上传时间</th><th scope="col">操作</th></tr></tfoot>
+                        </table>
                     </div>
                 </form>
+                <div class="tablenav bottom yxf-gallery-manage-topbar yxf-gallery-manage-bottom">
+                    <div class="alignleft actions"><select class="yxf-gallery-bulk-action"><option value="">批量操作</option><option value="delete">彻底删除</option></select><button type="button" class="button action yxf-gallery-delete-selected">应用</button><span class="description yxf-gallery-selected-count">未选择图片</span></div>
+                    <?php $render_pagination(); ?>
+                </div>
+                <div class="yxf-manage-preview-dialog" id="yxf-manage-preview-dialog" hidden role="dialog" aria-modal="true" aria-label="图片预览"><div class="yxf-manage-preview-mask" data-yxf-close-preview></div><div class="yxf-manage-preview-card"><button class="yxf-manage-preview-close" type="button" data-yxf-close-preview aria-label="关闭预览">×</button><img src="" alt="" id="yxf-manage-preview-image"><p id="yxf-manage-preview-name"></p></div></div>
                 <script>
-                (function(){var form=document.getElementById('yxf-gallery-manage-form'),all=document.getElementById('yxf-gallery-select-all'),remove=document.getElementById('yxf-gallery-delete-selected'),count=document.getElementById('yxf-gallery-selected-count');if(!form||!all||!remove||!count)return;var checks=function(){return [].slice.call(document.querySelectorAll('.yxf-gallery-item-check'));};var refresh=function(){var list=checks(),selected=list.filter(function(check){return check.checked;}).length;count.textContent=selected?'已选择 '+selected+' 张图片':'未选择图片';all.textContent=list.length&&selected===list.length?'取消全选':'全选';remove.disabled=!selected;};all.addEventListener('click',function(){var list=checks(),shouldSelect=list.some(function(check){return !check.checked;});list.forEach(function(check){check.checked=shouldSelect;});refresh();});document.addEventListener('change',function(event){if(event.target.classList.contains('yxf-gallery-item-check'))refresh();});form.addEventListener('submit',function(event){event.preventDefault();});remove.addEventListener('click',async function(){var selected=checks().filter(function(check){return check.checked;});if(!selected.length||!window.confirm('将永久删除所选图片的邮箱网盘原文件和网站图库记录，无法恢复。确定继续吗？'))return;remove.disabled=true;all.disabled=true;var failed=[];for(var index=0;index<selected.length;index++){var check=selected[index],card=check.closest('.yxf-gallery-manage-item'),data=new FormData();data.append('action','yxf_gallery_delete_remote_item');data.append('nonce',form.getAttribute('data-nonce'));data.append('item_id',check.value);remove.textContent='正在删除 '+(index+1)+'/'+selected.length;card.style.opacity='.55';try{var response=await fetch(form.getAttribute('data-ajax-url'),{method:'POST',body:data,credentials:'same-origin'}),payload=await response.json();if(!payload.success)throw new Error((payload.data&&payload.data.message)||'删除失败');card.remove();}catch(error){card.style.opacity='1';failed.push((card.querySelector('strong')||{}).textContent||('图片 #'+check.value));}}remove.textContent='删除选中图片及网盘文件';all.disabled=false;refresh();if(failed.length){window.alert('以下图片未删除：'+failed.join('、'));}else{window.alert('已删除 '+selected.length+' 张图片及其邮箱网盘文件。');}});refresh();}());
+                (function(){
+                    var form=document.getElementById('yxf-gallery-manage-form'),tableAlls=[].slice.call(document.querySelectorAll('.yxf-gallery-select-all-table')),bulks=[].slice.call(document.querySelectorAll('.yxf-gallery-bulk-action')),removes=[].slice.call(document.querySelectorAll('.yxf-gallery-delete-selected')),counts=[].slice.call(document.querySelectorAll('.yxf-gallery-selected-count'));
+                    if(!form||!tableAlls.length||!bulks.length||!removes.length||!counts.length)return;
+                    var checks=function(){return [].slice.call(document.querySelectorAll('.yxf-gallery-item-check'));};
+                    var refresh=function(){var list=checks(),selected=list.filter(function(check){return check.checked;}).length;counts.forEach(function(count){count.textContent=selected?'已选择 '+selected+' 张图片':'未选择图片';});tableAlls.forEach(function(tableAll){tableAll.checked=!!list.length&&selected===list.length;tableAll.indeterminate=selected>0&&selected<list.length;});};
+                    var chooseAll=function(shouldSelect){checks().forEach(function(check){check.checked=shouldSelect;});refresh();};
+                    var deleteItems=async function(selected,button){removes.forEach(function(item){item.disabled=true;});tableAlls.forEach(function(item){item.disabled=true;});bulks.forEach(function(item){item.disabled=true;});var failed=[];for(var index=0;index<selected.length;index++){var check=selected[index],row=check.closest('.yxf-gallery-manage-item'),data=new FormData();data.append('action','yxf_gallery_delete_remote_item');data.append('nonce',form.getAttribute('data-nonce'));data.append('item_id',check.value);removes.forEach(function(item){item.textContent='正在删除 '+(index+1)+'/'+selected.length;});row.style.opacity='.55';try{var response=await fetch(form.getAttribute('data-ajax-url'),{method:'POST',body:data,credentials:'same-origin'}),payload=await response.json();if(!payload.success)throw new Error((payload.data&&payload.data.message)||'删除失败');row.remove();}catch(error){row.style.opacity='1';failed.push((row.querySelector('.yxf-manage-name')||{}).textContent||('图片 #'+check.value));}}removes.forEach(function(item){item.textContent='应用';item.disabled=false;});tableAlls.forEach(function(item){item.disabled=false;});bulks.forEach(function(item){item.disabled=false;});refresh();if(failed.length){window.alert('以下图片未删除：'+failed.join('、'));}else{window.alert('已删除 '+selected.length+' 张图片及其邮箱网盘文件。');}};
+                    tableAlls.forEach(function(tableAll){tableAll.addEventListener('change',function(){chooseAll(tableAll.checked);});});
+                    document.addEventListener('change',function(event){if(event.target.classList.contains('yxf-gallery-item-check'))refresh();});
+                    form.addEventListener('submit',function(event){event.preventDefault();});
+                    removes.forEach(function(remove,index){remove.addEventListener('click',function(){var selected=checks().filter(function(check){return check.checked;});if(bulks[index].value!=='delete'){window.alert('请先选择批量操作方式。');return;}if(!selected.length){window.alert('请先选择需要操作的图片。');return;}if(window.confirm('将永久删除所选图片的邮箱网盘原文件和网站图库记录，无法恢复。确定继续吗？'))deleteItems(selected,remove);});});
+                    form.addEventListener('click',function(event){var preview=event.target.closest('.yxf-manage-image-preview');if(preview){var dialog=document.getElementById('yxf-manage-preview-dialog'),image=document.getElementById('yxf-manage-preview-image'),name=document.getElementById('yxf-manage-preview-name');if(dialog&&image&&name){image.src=preview.getAttribute('data-image-url')||'';image.alt=preview.getAttribute('data-image-name')||'';name.textContent=preview.getAttribute('data-image-name')||'';dialog.hidden=false;}return;}var button=event.target.closest('.yxf-manage-delete-item');if(!button)return;var check=button.closest('.yxf-gallery-manage-item').querySelector('.yxf-gallery-item-check');if(check&&window.confirm('将永久删除此图片的邮箱网盘原文件和网站图库记录，无法恢复。确定继续吗？'))deleteItems([check],button);});
+                    document.addEventListener('click',function(event){if(!event.target.closest('[data-yxf-close-preview]'))return;var dialog=document.getElementById('yxf-manage-preview-dialog');if(dialog)dialog.hidden=true;});
+                    document.addEventListener('keydown',function(event){if(event.key==='Escape'){var dialog=document.getElementById('yxf-manage-preview-dialog');if(dialog)dialog.hidden=true;}});
+                    refresh();
+                }());
                 </script>
             <?php endif; ?>
         </div>
