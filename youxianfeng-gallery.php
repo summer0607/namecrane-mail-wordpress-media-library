@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 游先锋图库
  * Description: 将媒体上传至游先锋邮箱存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 0.5.23
+ * Version: 0.5.24
  * Update URI: https://github.com/summer0607/youxianfeng-gallery
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '0.5.23';
+    const VERSION = '0.5.24';
     const GITHUB_REPOSITORY = 'summer0607/youxianfeng-gallery';
     const RELEASE_ASSET = 'youxianfeng-gallery.zip';
     const UPDATE_CACHE_KEY = 'yxf_gallery_github_release';
@@ -945,16 +945,57 @@ final class YouXianFeng_Gallery {
         if (!$file || !empty($file['error']) || empty($file['tmp_name']) || !is_uploaded_file($file['tmp_name'])) {
             return new WP_Error('upload_error', '请选择有效的图片文件。');
         }
-        $file_name = sanitize_file_name((string) $file['name']);
-        $type = wp_check_filetype_and_ext($file['tmp_name'], $file_name);
+
+        return self::upload_local_image_file((string) $file['tmp_name'], (string) $file['name'], (int) $file['size']);
+    }
+
+    /**
+     * 供可信的后台插件上传其生成的本地图片，并复用图库的权限、去重与公开链接流程。
+     *
+     * @return array{url:string,attachment_id:int,name:string,duplicate:bool,warning:string}|WP_Error
+     */
+    public static function upload_generated_image(string $tmp_name, string $file_name) {
+        if (!self::can_use_gallery()) {
+            return new WP_Error('gallery_permission_denied', '当前账号无权上传游先锋图库图片。');
+        }
+        if ($tmp_name === '' || !is_file($tmp_name) || !is_readable($tmp_name)) {
+            return new WP_Error('generated_image_missing', '待上传的图片文件不存在。');
+        }
+
+        $result = self::upload_local_image_file($tmp_name, $file_name, (int) filesize($tmp_name));
+        if (is_wp_error($result)) {
+            return $result;
+        }
+
+        $item = $result['item'] ?? null;
+        $url  = $item && (string) ($item->status ?? '') === 'ready' ? self::item_public_url($item) : '';
+        if ($url === '') {
+            return new WP_Error('gallery_public_url_failed', '图片已上传，但未能获得游先锋图库公开链接。');
+        }
+
+        return array(
+            'url'           => esc_url_raw($url),
+            'attachment_id' => (int) ($item->attachment_id ?? 0),
+            'name'          => (string) ($item->file_name ?? $file_name),
+            'duplicate'     => !empty($result['duplicate']),
+            'warning'       => (string) ($result['warning'] ?? ''),
+        );
+    }
+
+    /**
+     * @return array{item:object,duplicate:bool,warning:string}|WP_Error
+     */
+    private static function upload_local_image_file(string $tmp_name, string $file_name, int $file_size) {
+        $file_name = sanitize_file_name($file_name);
+        $type = wp_check_filetype_and_ext($tmp_name, $file_name);
         if (empty($type['type']) || strpos((string) $type['type'], 'image/') !== 0) {
             return new WP_Error('not_image', '仅支持上传图片文件。');
         }
         $max_size = (int) apply_filters('yxf_gallery_max_upload_size', 1024 * MB_IN_BYTES);
-        if ((int) $file['size'] > $max_size) {
+        if ($file_size > $max_size) {
             return new WP_Error('too_large', '单个图片文件不能超过 1GB。');
         }
-        $file_hash = hash_file('sha256', $file['tmp_name']);
+        $file_hash = hash_file('sha256', $tmp_name);
         if (!$file_hash) {
             return new WP_Error('hash_failed', '无法识别图片内容，请重新选择图片。');
         }
@@ -978,7 +1019,7 @@ final class YouXianFeng_Gallery {
             return new WP_Error('login_required', '请先在“登录”中保存自己的游先锋邮箱账号和密码。');
         }
         $remote_file = gmdate('Ymd-His') . '-' . wp_generate_password(8, false, false) . '-' . $file_name;
-        $uploaded = self::storage_upload($settings, $password, $file['tmp_name'], $remote_file);
+        $uploaded = self::storage_upload($settings, $password, $tmp_name, $remote_file);
         $upload_warning = '';
         if (is_wp_error($uploaded)) {
             // 上传连接可能在文件已写入后才超时或断开。先到邮箱网盘确认，
@@ -999,7 +1040,7 @@ final class YouXianFeng_Gallery {
             'mime_type'    => $type['type'],
             'remote_path'  => rtrim($settings['sftp_remote_path'], '/') . '/' . $remote_file,
             'file_hash'    => $file_hash,
-            'file_size'    => max(0, (int) $file['size']),
+            'file_size'    => max(0, $file_size),
             'status'       => $is_ready ? 'ready' : 'pending',
             'author_id'    => get_current_user_id(),
             'created_at'   => current_time('mysql'),
