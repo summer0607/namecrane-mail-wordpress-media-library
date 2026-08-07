@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 游先锋图库
  * Description: 将媒体上传至游先锋邮箱存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 0.5.6
+ * Version: 0.5.7
  * Update URI: https://github.com/summer0607/youxianfeng-gallery
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '0.5.6';
+    const VERSION = '0.5.7';
     const GITHUB_REPOSITORY = 'summer0607/youxianfeng-gallery';
     const RELEASE_ASSET = 'youxianfeng-gallery.zip';
     const UPDATE_CACHE_KEY = 'yxf_gallery_github_release';
@@ -401,18 +401,33 @@ final class YouXianFeng_Gallery {
     }
 
     public static function check_for_update($transient) {
-        if (empty($transient->checked) || !is_object($transient)) {
+        if (!is_object($transient) || empty($transient->checked)) {
             return $transient;
         }
+        // WordPress 会暂存上一次检测到的版本。插件刚升级后，必须先移除
+        // 该旧记录，否则后台仍会把已安装版本误显示为“有更新”。
+        $plugin_file = self::plugin_file();
+        unset($transient->response[$plugin_file]);
         $release = self::release_data();
         $package = is_array($release) ? self::release_package($release) : '';
         $version = is_array($release) ? ltrim((string) $release['tag_name'], 'vV') : '';
         if ($version === '' || $package === '' || !version_compare($version, self::VERSION, '>')) {
+            if (!isset($transient->no_update) || !is_array($transient->no_update)) {
+                $transient->no_update = array();
+            }
+            $transient->no_update[$plugin_file] = (object) array(
+                'slug'        => dirname($plugin_file),
+                'plugin'      => $plugin_file,
+                'new_version' => self::VERSION,
+                'url'         => 'https://github.com/' . self::GITHUB_REPOSITORY,
+                'package'     => '',
+            );
             return $transient;
         }
-        $transient->response[self::plugin_file()] = (object) array(
-            'slug'        => dirname(self::plugin_file()),
-            'plugin'      => self::plugin_file(),
+        unset($transient->no_update[$plugin_file]);
+        $transient->response[$plugin_file] = (object) array(
+            'slug'        => dirname($plugin_file),
+            'plugin'      => $plugin_file,
             'new_version' => $version,
             'url'         => 'https://github.com/' . self::GITHUB_REPOSITORY,
             'package'     => $package,
