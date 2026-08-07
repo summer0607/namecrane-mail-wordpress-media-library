@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 游先锋图库
  * Description: 将媒体上传至游先锋邮箱存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 0.5.9
+ * Version: 0.5.10
  * Update URI: https://github.com/summer0607/youxianfeng-gallery
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '0.5.9';
+    const VERSION = '0.5.10';
     const GITHUB_REPOSITORY = 'summer0607/youxianfeng-gallery';
     const RELEASE_ASSET = 'youxianfeng-gallery.zip';
     const UPDATE_CACHE_KEY = 'yxf_gallery_github_release';
@@ -512,16 +512,10 @@ final class YouXianFeng_Gallery {
             return new WP_Error('storage_unsupported', '当前网站环境未启用 ' . strtoupper($protocol) . ' 文件存储协议。');
         }
 
-        if (defined('CURLOPT_PROTOCOLS_STR')) {
-            return array(CURLOPT_PROTOCOLS_STR => $protocol);
-        }
-
-        $constant = $protocol === 'sftp' ? 'CURLPROTO_SFTP' : 'CURLPROTO_FTP';
-        if (defined('CURLOPT_PROTOCOLS') && defined($constant)) {
-            return array(CURLOPT_PROTOCOLS => constant($constant));
-        }
-
-        return new WP_Error('storage_unsupported', '当前网站的 cURL 版本过低，无法安全使用 ' . strtoupper($protocol) . ' 文件存储协议。');
+        // 某些服务器的 PHP 扩展会声明新选项，但底层 libcurl 并不接受它，
+        // curl_setopt_array 会直接抛出致命错误。URL 协议由本插件固定生成，
+        // 已完成协议可用性核验后，不再额外传入可能不兼容的限制选项。
+        return array();
     }
 
     private static function storage_test($settings, $password) {
