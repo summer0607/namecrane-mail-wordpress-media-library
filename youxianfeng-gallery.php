@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 游先锋图库
  * Description: 将媒体上传至游先锋邮箱存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 0.5.7
+ * Version: 0.5.8
  * Update URI: https://github.com/summer0607/youxianfeng-gallery
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '0.5.7';
+    const VERSION = '0.5.8';
     const GITHUB_REPOSITORY = 'summer0607/youxianfeng-gallery';
     const RELEASE_ASSET = 'youxianfeng-gallery.zip';
     const UPDATE_CACHE_KEY = 'yxf_gallery_github_release';
@@ -470,6 +470,9 @@ final class YouXianFeng_Gallery {
         }
         check_admin_referer('yxf_gallery_check_update');
         delete_site_transient(self::UPDATE_CACHE_KEY);
+        // wp_update_plugins() 会在短时间内直接复用 WordPress 的全站更新结果。
+        // 同时清除它，才能让“检查更新”确实重新读取 GitHub 的当前版本。
+        delete_site_transient('update_plugins');
         wp_update_plugins();
         wp_safe_redirect(add_query_arg('yxf_gallery_update_checked', '1', admin_url('plugins.php')));
         exit;
