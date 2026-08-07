@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 游先锋图库
  * Description: 将媒体上传至游先锋邮箱存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 0.5.12
+ * Version: 0.5.13
  * Update URI: https://github.com/summer0607/youxianfeng-gallery
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '0.5.12';
+    const VERSION = '0.5.13';
     const GITHUB_REPOSITORY = 'summer0607/youxianfeng-gallery';
     const RELEASE_ASSET = 'youxianfeng-gallery.zip';
     const UPDATE_CACHE_KEY = 'yxf_gallery_github_release';
@@ -547,7 +547,8 @@ final class YouXianFeng_Gallery {
         }
         $curl = curl_init();
         $target = sprintf('%s://%s:%d%s', $protocol, $settings['sftp_host'], $settings['sftp_port'], rtrim($settings['sftp_remote_path'], '/') . '/');
-        $configured = self::curl_set_options($curl, array_merge(array(
+        // cURL 选项是数字编号；array_merge 会重编号，必须用 array_replace 保持原编号。
+        $configured = self::curl_set_options($curl, array_replace(array(
             CURLOPT_URL           => $target,
             // CURLOPT_USERPWD 的兼容范围远大于 USERNAME/PASSWORD 分拆选项。
             CURLOPT_USERPWD       => $settings['sftp_username'] . ':' . $password,
@@ -596,7 +597,7 @@ final class YouXianFeng_Gallery {
             return $protocol_options;
         }
         $curl = curl_init();
-        $configured = self::curl_set_options($curl, array_merge(array(
+        $configured = self::curl_set_options($curl, array_replace(array(
             CURLOPT_URL            => self::storage_url($settings, $remote_file),
             CURLOPT_USERPWD        => $settings['sftp_username'] . ':' . $password,
             CURLOPT_CONNECTTIMEOUT => 15,
@@ -629,7 +630,7 @@ final class YouXianFeng_Gallery {
             return $protocol_options;
         }
         $curl = curl_init();
-        $configured = self::curl_set_options($curl, array_merge(array(
+        $configured = self::curl_set_options($curl, array_replace(array(
             CURLOPT_URL            => self::storage_path_url($settings, $remote_path),
             CURLOPT_USERPWD        => $settings['sftp_username'] . ':' . $password,
             // 每次仅删除一张图片；设置较短超时，避免邮箱服务异常拖垮后台页面。
