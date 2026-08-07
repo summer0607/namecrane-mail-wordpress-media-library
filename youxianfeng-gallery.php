@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 游先锋图库
  * Description: 将媒体上传至游先锋邮箱存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 0.5.3
+ * Version: 0.5.4
  * Update URI: https://github.com/summer0607/youxianfeng-gallery
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '0.5.3';
+    const VERSION = '0.5.4';
     const GITHUB_REPOSITORY = 'summer0607/youxianfeng-gallery';
     const RELEASE_ASSET = 'youxianfeng-gallery.zip';
     const UPDATE_CACHE_KEY = 'yxf_gallery_github_release';
@@ -791,14 +791,15 @@ final class YouXianFeng_Gallery {
             $item_id = absint($_POST['item_id'] ?? 0);
             if ($item_id) {
                 global $wpdb;
-                $item = $wpdb->get_row($wpdb->prepare("SELECT author_id, attachment_id FROM " . self::table_name() . " WHERE id = %d", $item_id));
+                $item = $wpdb->get_row($wpdb->prepare("SELECT * FROM " . self::table_name() . " WHERE id = %d", $item_id));
                 $owner_id = $item ? (int) $item->author_id : 0;
                 if (!$owner_id || !self::can_delete_item($owner_id)) {
                     wp_die('无权删除其他用户上传的图片。');
                 }
-                $wpdb->delete(self::table_name(), array('id' => $item_id), array('%d'));
-                if (!empty($item->attachment_id)) {
-                    wp_delete_attachment((int) $item->attachment_id, true);
+                $result = self::delete_item_with_remote_file($item);
+                if (is_wp_error($result)) {
+                    set_transient('yxf_gallery_notice_' . get_current_user_id(), array('error', $result->get_error_message()), MINUTE_IN_SECONDS);
+                    self::redirect(self::can_administer() ? 'yxf-gallery-manage' : 'yxf-gallery', 'stored_notice');
                 }
             }
             self::redirect(self::can_administer() ? 'yxf-gallery-manage' : 'yxf-gallery', 'deleted');
@@ -1135,7 +1136,7 @@ final class YouXianFeng_Gallery {
                             <?php if ($item->status === 'ready' && strpos((string) $item->mime_type, 'image/') === 0) : ?><img src="<?php echo esc_url($item_url); ?>" alt="" loading="lazy" decoding="async" style="display:block;width:100%;height:140px;object-fit:cover;background:#f0f0f1"><?php elseif ($item->status === 'ready') : ?><a href="<?php echo esc_url($item_url); ?>" target="_blank" rel="noopener" style="height:140px;display:flex;align-items:center;justify-content:center;background:#f6f7f7;color:#2271b1;text-decoration:none">媒体文件<br><?php echo esc_html(strtoupper((string) $item->mime_type)); ?></a><?php else : ?><div style="height:140px;display:flex;align-items:center;justify-content:center;background:#f6f7f7;color:#646970">等待公开链接</div><?php endif; ?>
                             <p style="margin:10px 0 6px;word-break:break-all"><strong><?php echo esc_html($item->file_name ?: '图片'); ?></strong><br><small><?php echo esc_html($item->mime_type); ?></small></p>
                             <p style="margin:0;display:flex;gap:6px"><input class="widefat" type="text" readonly value="<?php echo esc_attr($item->status === 'ready' ? $item_url : '公开链接待生成'); ?>"><?php if ($item->status === 'ready') : ?><button class="button yxf-copy-link" type="button" data-copy-url="<?php echo esc_attr($item_url); ?>">复制链接</button><?php endif; ?></p>
-                            <form method="post" style="margin-top:10px" onsubmit="return confirm('仅删除图库记录，不会删除你网盘中的原文件。确定继续吗？');"><?php wp_nonce_field('yxf_gallery_delete'); ?><input type="hidden" name="yxf_gallery_action" value="delete_item"><input type="hidden" name="item_id" value="<?php echo absint($item->id); ?>"><button class="button button-small button-link-delete">删除图片记录</button></form>
+                            <form method="post" style="margin-top:10px" onsubmit="return confirm('将永久删除此图片的邮箱网盘原文件和图库记录，无法恢复。确定继续吗？');"><?php wp_nonce_field('yxf_gallery_delete'); ?><input type="hidden" name="yxf_gallery_action" value="delete_item"><input type="hidden" name="item_id" value="<?php echo absint($item->id); ?>"><button class="button button-small button-link-delete">删除图片</button></form>
                         </article>
                     <?php endforeach; ?>
                 </div>
