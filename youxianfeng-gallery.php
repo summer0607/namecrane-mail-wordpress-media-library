@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 游先锋图库
  * Description: 将媒体上传至游先锋邮箱存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 0.5.11
+ * Version: 0.5.12
  * Update URI: https://github.com/summer0607/youxianfeng-gallery
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '0.5.11';
+    const VERSION = '0.5.12';
     const GITHUB_REPOSITORY = 'summer0607/youxianfeng-gallery';
     const RELEASE_ASSET = 'youxianfeng-gallery.zip';
     const UPDATE_CACHE_KEY = 'yxf_gallery_github_release';
@@ -549,12 +549,10 @@ final class YouXianFeng_Gallery {
         $target = sprintf('%s://%s:%d%s', $protocol, $settings['sftp_host'], $settings['sftp_port'], rtrim($settings['sftp_remote_path'], '/') . '/');
         $configured = self::curl_set_options($curl, array_merge(array(
             CURLOPT_URL           => $target,
-            CURLOPT_USERNAME      => $settings['sftp_username'],
-            CURLOPT_PASSWORD      => $password,
+            // CURLOPT_USERPWD 的兼容范围远大于 USERNAME/PASSWORD 分拆选项。
+            CURLOPT_USERPWD       => $settings['sftp_username'] . ':' . $password,
             CURLOPT_CONNECTTIMEOUT=> 15,
             CURLOPT_TIMEOUT       => 40,
-            CURLOPT_DIRLISTONLY   => true,
-            CURLOPT_WRITEFUNCTION => static function ($handle, $data) { return strlen($data); },
         ), $protocol_options));
         if (is_wp_error($configured)) { curl_close($curl); return $configured; }
         if ($protocol === 'sftp') {
@@ -600,8 +598,7 @@ final class YouXianFeng_Gallery {
         $curl = curl_init();
         $configured = self::curl_set_options($curl, array_merge(array(
             CURLOPT_URL            => self::storage_url($settings, $remote_file),
-            CURLOPT_USERNAME       => $settings['sftp_username'],
-            CURLOPT_PASSWORD       => $password,
+            CURLOPT_USERPWD        => $settings['sftp_username'] . ':' . $password,
             CURLOPT_CONNECTTIMEOUT => 15,
             CURLOPT_TIMEOUT        => 180,
             CURLOPT_UPLOAD         => true,
@@ -634,8 +631,7 @@ final class YouXianFeng_Gallery {
         $curl = curl_init();
         $configured = self::curl_set_options($curl, array_merge(array(
             CURLOPT_URL            => self::storage_path_url($settings, $remote_path),
-            CURLOPT_USERNAME       => $settings['sftp_username'],
-            CURLOPT_PASSWORD       => $password,
+            CURLOPT_USERPWD        => $settings['sftp_username'] . ':' . $password,
             // 每次仅删除一张图片；设置较短超时，避免邮箱服务异常拖垮后台页面。
             CURLOPT_CONNECTTIMEOUT => 5,
             CURLOPT_TIMEOUT        => 12,
