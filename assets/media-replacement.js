@@ -257,6 +257,12 @@
             // 会被误当作主题上传入口拦截，造成标签无法切换、文件无法选择。
             if (event.target.closest && event.target.closest('#yxf-media-frame')) return;
             var raw = event.target.closest && event.target.closest('input[type="file"],[zibupload="image_upload"],.z_upload_image_button,.ashu_upload_button,.csf--button,.upload-btn,.preview .add,.preview.upload-preview');
+            // 插件、主题、导入等 WordPress 系统安装页也会有 file input。
+            // 它们不是媒体上传入口，绝不能被图库接管。
+            var $rawCandidate = raw ? $(raw) : $();
+            if ($('body').is('.plugin-install-php,.theme-install-php,.update-core-php,.import-php') ||
+                $rawCandidate.is('[name="pluginzip"],[name="themezip"],[name="import"],[name="userfile"]') ||
+                $rawCandidate.closest('form[action*="update.php"],form[action*="import.php"]').length) return;
             if (!raw && event.target.closest) {
                 var control = event.target.closest('button,a');
                 var label = control ? String(control.getAttribute('title') || control.getAttribute('aria-label') || control.textContent || '').replace(/\s+/g, '') : '';
