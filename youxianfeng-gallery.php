@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 游先锋图库
  * Description: 将媒体上传至游先锋邮箱存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 0.5.10
+ * Version: 0.5.11
  * Update URI: https://github.com/summer0607/youxianfeng-gallery
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '0.5.10';
+    const VERSION = '0.5.11';
     const GITHUB_REPOSITORY = 'summer0607/youxianfeng-gallery';
     const RELEASE_ASSET = 'youxianfeng-gallery.zip';
     const UPDATE_CACHE_KEY = 'yxf_gallery_github_release';
@@ -518,6 +518,18 @@ final class YouXianFeng_Gallery {
         return array();
     }
 
+    /** 个别主机的 cURL 扩展会对不支持的选项抛出 ValueError，不能让后台直接中断。 */
+    private static function curl_set_options($curl, $options) {
+        try {
+            foreach ((array) $options as $option => $value) {
+                curl_setopt($curl, $option, $value);
+            }
+        } catch (Throwable $error) {
+            return new WP_Error('curl_option_unsupported', '当前服务器的 cURL 不支持所需的连接选项：' . $error->getMessage());
+        }
+        return true;
+    }
+
     private static function storage_test($settings, $password) {
         foreach (array('sftp_host' => '存储服务器', 'sftp_username' => '存储用户名', 'sftp_remote_path' => '目标目录') as $key => $label) {
             if (empty($settings[$key])) {
@@ -535,7 +547,7 @@ final class YouXianFeng_Gallery {
         }
         $curl = curl_init();
         $target = sprintf('%s://%s:%d%s', $protocol, $settings['sftp_host'], $settings['sftp_port'], rtrim($settings['sftp_remote_path'], '/') . '/');
-        curl_setopt_array($curl, array_merge(array(
+        $configured = self::curl_set_options($curl, array_merge(array(
             CURLOPT_URL           => $target,
             CURLOPT_USERNAME      => $settings['sftp_username'],
             CURLOPT_PASSWORD      => $password,
@@ -544,6 +556,7 @@ final class YouXianFeng_Gallery {
             CURLOPT_DIRLISTONLY   => true,
             CURLOPT_WRITEFUNCTION => static function ($handle, $data) { return strlen($data); },
         ), $protocol_options));
+        if (is_wp_error($configured)) { curl_close($curl); return $configured; }
         if ($protocol === 'sftp') {
             curl_setopt($curl, CURLOPT_SSH_AUTH_TYPES, CURLSSH_AUTH_PASSWORD);
         } else {
@@ -585,7 +598,7 @@ final class YouXianFeng_Gallery {
             return $protocol_options;
         }
         $curl = curl_init();
-        curl_setopt_array($curl, array_merge(array(
+        $configured = self::curl_set_options($curl, array_merge(array(
             CURLOPT_URL            => self::storage_url($settings, $remote_file),
             CURLOPT_USERNAME       => $settings['sftp_username'],
             CURLOPT_PASSWORD       => $password,
@@ -595,6 +608,7 @@ final class YouXianFeng_Gallery {
             CURLOPT_INFILE         => $stream,
             CURLOPT_INFILESIZE     => filesize($local_file),
         ), $protocol_options));
+        if (is_wp_error($configured)) { fclose($stream); curl_close($curl); return $configured; }
         if ($protocol === 'sftp') {
             curl_setopt($curl, CURLOPT_SSH_AUTH_TYPES, CURLSSH_AUTH_PASSWORD);
         } else {
@@ -618,7 +632,7 @@ final class YouXianFeng_Gallery {
             return $protocol_options;
         }
         $curl = curl_init();
-        curl_setopt_array($curl, array_merge(array(
+        $configured = self::curl_set_options($curl, array_merge(array(
             CURLOPT_URL            => self::storage_path_url($settings, $remote_path),
             CURLOPT_USERNAME       => $settings['sftp_username'],
             CURLOPT_PASSWORD       => $password,
@@ -628,6 +642,7 @@ final class YouXianFeng_Gallery {
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_FAILONERROR    => true,
         ), $protocol_options));
+        if (is_wp_error($configured)) { curl_close($curl); return $configured; }
         if ($protocol === 'sftp') {
             curl_setopt($curl, CURLOPT_SSH_AUTH_TYPES, CURLSSH_AUTH_PASSWORD);
             curl_setopt($curl, CURLOPT_NOBODY, true);
