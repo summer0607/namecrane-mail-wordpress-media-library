@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 游先锋图库
  * Description: 将媒体上传至游先锋邮箱存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 0.5.13
+ * Version: 0.5.14
  * Update URI: https://github.com/summer0607/youxianfeng-gallery
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '0.5.13';
+    const VERSION = '0.5.14';
     const GITHUB_REPOSITORY = 'summer0607/youxianfeng-gallery';
     const RELEASE_ASSET = 'youxianfeng-gallery.zip';
     const UPDATE_CACHE_KEY = 'yxf_gallery_github_release';
@@ -1242,7 +1242,7 @@ final class YouXianFeng_Gallery {
             function key(file){return [file.name,file.size,file.lastModified].join(':');}
             function render(){list.innerHTML='';queue.forEach(function(item,id){var row=document.createElement('li');row.className='yxf-upload-item is-'+item.state;row.innerHTML='<span class="yxf-upload-item-name"></span><span class="yxf-upload-item-status"></span>';row.querySelector('.yxf-upload-item-name').textContent=item.file.name;row.querySelector('.yxf-upload-item-status').textContent=item.message;if(item.state==='waiting'||item.state==='error'){var remove=document.createElement('button');remove.type='button';remove.className='yxf-upload-item-remove';remove.textContent='移除';remove.addEventListener('click',function(){queue.delete(id);render();});row.appendChild(remove);}list.appendChild(row);});start.disabled=uploading||![...queue.values()].some(function(item){return item.state==='waiting'||item.state==='error';});}
             function add(files){Array.prototype.forEach.call(files,function(file){if(!file.type.match(/^image\//)){return;}var id=key(file);if(!queue.has(id)){queue.set(id,{file:file,state:'waiting',message:'等待上传'});}});input.value='';render();}
-            async function send(item){item.state='uploading';item.message='正在上传…';render();var data=new FormData();data.append('action','yxf_gallery_upload_image');data.append('nonce',nonce);data.append('gallery_file',item.file,item.file.name);try{var response=await fetch(ajaxUrl,{method:'POST',body:data,credentials:'same-origin'});var payload=await response.json();if(!payload.success){throw new Error((payload.data&&payload.data.message)||'上传失败，请重试。');}item.state='success';item.message=payload.data.duplicate?'已存在，无需重复上传':(payload.data.warning?'已上传，公开链接正在生成':'上传完成');}catch(error){item.state='error';item.message=error.message||'上传失败，请重试。';}render();}
+            async function send(item){item.state='uploading';item.message='正在上传…';render();var data=new FormData();data.append('action','yxf_gallery_upload_image');data.append('nonce',nonce);data.append('gallery_file',item.file,item.file.name);try{var response=await fetch(ajaxUrl,{method:'POST',body:data,credentials:'same-origin'}),raw=await response.text(),payload;try{payload=JSON.parse(raw);}catch(parseError){throw new Error('服务器未返回有效的上传结果，请重新登录游先锋邮箱后再试。');}if(!payload.success){throw new Error((payload.data&&payload.data.message)||'上传失败，请重试。');}item.state='success';item.message=payload.data.duplicate?'已存在，无需重复上传':(payload.data.warning?'已上传，公开链接正在生成':'上传完成');}catch(error){item.state='error';item.message=error.message||'上传失败，请重试。';}render();}
             async function run(){if(uploading){return;}uploading=true;render();for(const item of queue.values()){if(item.state==='waiting'||item.state==='error'){await send(item);}}uploading=false;render();}
             choose.addEventListener('click',function(){input.click();});input.addEventListener('change',function(){add(input.files);});start.addEventListener('click',run);render();
         }());
@@ -1564,7 +1564,7 @@ final class YouXianFeng_Gallery {
             var uploadOne = async function(entry){
                 entry.state = 'uploading'; entry.message = '正在上传…'; renderUploadQueue();
                 var data = new FormData(); data.append('action', 'yxf_gallery_upload_image'); data.append('nonce', uploadNonce); data.append('gallery_file', entry.file, entry.file.name);
-                try { var response = await fetch(ajaxUrl, {method:'POST', body:data, credentials:'same-origin'}); var payload = await response.json(); if (!payload.success) throw new Error((payload.data && payload.data.message) || '上传失败，请重试。'); entry.state = 'success'; entry.message = payload.data.duplicate ? '已存在，无需重复上传' : (payload.data.warning ? '已上传，公开链接正在生成' : '上传完成'); addUploadedItem(payload.data); }
+                try { var response = await fetch(ajaxUrl, {method:'POST', body:data, credentials:'same-origin'}), raw = await response.text(), payload; try { payload = JSON.parse(raw); } catch (parseError) { throw new Error('服务器未返回有效的上传结果，请重新登录游先锋邮箱后再试。'); } if (!payload.success) throw new Error((payload.data && payload.data.message) || '上传失败，请重试。'); entry.state = 'success'; entry.message = payload.data.duplicate ? '已存在，无需重复上传' : (payload.data.warning ? '已上传，公开链接正在生成' : '上传完成'); addUploadedItem(payload.data); }
                 catch(error) { entry.state = 'error'; entry.message = error.message || '上传失败，请重试。'; }
                 renderUploadQueue();
             };
