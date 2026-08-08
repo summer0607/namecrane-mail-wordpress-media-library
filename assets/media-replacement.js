@@ -8,6 +8,7 @@
 
     function galleryUrl(options, callbackKey) {
         var query = {
+            yxf_gallery_frame: 1,
             type: 'yxf_gallery',
             TB_iframe: 1,
             width: 900,
@@ -30,6 +31,30 @@
     window.YXFGalleryClose = function () {
         closeGalleryOverlay();
     };
+
+    // 图库 iframe 上传完成后，同步更新仍在背后的子比“我的图片/我的文件”列表。
+    // 这样用户取消返回主题窗口时，也能立即看到刚上传的新文件，无需刷新页面。
+    window.addEventListener('message', function (event) {
+        if (event.origin !== window.location.origin || !event.data || event.data.type !== 'yxf_gallery_uploaded') return;
+        var item = event.data.item || {};
+        var id = Number(item.attachmentId || 0);
+        var url = String(item.url || '');
+        if (!id || !url) return;
+        $('.modal.in .mini-media-my-lists:visible').each(function () {
+            var $list = $(this);
+            if ($list.find('.list-item[data-file-id="' + id + '"]').length) return;
+            var kind = String(item.kind || '').toLowerCase();
+            if ($list.hasClass('type-image') && kind !== 'image') return;
+            var $entry = $('<div class="list-item"></div>').attr('data-file-id', id).attr('data-file-type', kind || 'file');
+            var $box = $('<div class="list-box"></div>').appendTo($entry);
+            if (kind === 'image') {
+                $('<img>').attr({src: url, 'data-full-url': url, alt: item.name || ''}).appendTo($box);
+            } else {
+                $('<span class="text-ellipsis"></span>').text(item.name || '媒体文件').appendTo($box);
+            }
+            $list.prepend($entry);
+        });
+    });
 
     function openGallery(options, callback) {
         var key = 'yxf_gallery_' + Date.now() + '_' + Math.random().toString(36).slice(2);
@@ -320,6 +345,27 @@
         $element.trigger('yxf_gallery_selected', [item, items]);
     }
 
+    // 子比前台编辑器已经创建好的旧媒体窗口，无法接收后来替换脚本的回传事件。
+    // 此时直接写入编辑器并关闭旧窗口，图片和附件都无需刷新“我的图片/我的文件”。
+    function insertIntoZibEditor(element, items) {
+        var $modal = $(element).closest('.modal');
+        if (!$modal.length || !$modal.find('.mini-media-my-box').length || !items.length) return false;
+        var editor = window.tinymce && window.tinymce.activeEditor;
+        if (!editor || !editor.insertContent) return false;
+        var html = items.map(function (item) {
+            var url = String(item.url || '').replace(/"/g, '&quot;');
+            var name = String(item.name || item.url || '媒体文件').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            if ((item.kind || '').toLowerCase() === 'image') {
+                return '<p><img src="' + url + '" data-full-url="' + url + '" data-edit-file-id="' + Number(item.attachmentId || 0) + '" alt="' + name + '"></p>';
+            }
+            return '<p><a href="' + url + '" data-mce-href="' + url + '" data-download-file="' + url + '" class="but c-blue file-download-btn">' + name + '</a></p>';
+        }).join('') + '<p></p>';
+        editor.insertContent(html);
+        if (editor.undoManager && editor.undoManager.add) editor.undoManager.add();
+        $modal.find('.close,[data-dismiss="modal"]').first().trigger('click');
+        return true;
+    }
+
     function galleryButtonTarget(target) {
         var $target = $(target);
         if ($target.is('input[type="file"]')) return target;
@@ -365,6 +411,7 @@
             var isForumQuickUpload = $(raw).closest('.quick-upload').length > 0;
             openGallery({ type: isForumQuickUpload ? 'image' : typeFromElement(target), multiple: isForumQuickUpload ? 9 : selectionLimit(target) }, function (items) {
                 if (applyForumQuickUpload(raw, items)) return;
+                if (insertIntoZibEditor(raw, items)) return;
                 applyThemeSelection(raw, items);
                 if (target !== raw) applyThemeSelection(target, items);
             });

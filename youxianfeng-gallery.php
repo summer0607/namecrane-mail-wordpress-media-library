@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 游先锋图库
  * Description: 将媒体上传至游先锋邮箱存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 0.5.28
+ * Version: 1.0.0
  * Update URI: https://github.com/summer0607/youxianfeng-gallery
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '0.5.28';
+    const VERSION = '1.0.0';
     const GITHUB_REPOSITORY = 'summer0607/youxianfeng-gallery';
     const RELEASE_ASSET = 'youxianfeng-gallery.zip';
     const UPDATE_CACHE_KEY = 'yxf_gallery_github_release';
@@ -21,7 +21,7 @@ final class YouXianFeng_Gallery {
     const CAPS_OPTION = 'yxf_gallery_caps_version';
     const TABLE_SUFFIX = 'yxf_gallery_items';
     const DB_OPTION = 'yxf_gallery_db_version';
-    const DB_VERSION = '5';
+    const DB_VERSION = '6';
 
     public static function init() {
         add_action('plugins_loaded', array(__CLASS__, 'maybe_upgrade'));
@@ -30,6 +30,10 @@ final class YouXianFeng_Gallery {
         add_action('admin_init', array(__CLASS__, 'handle_admin_actions'));
         add_action('wp_ajax_yxf_gallery_upload_image', array(__CLASS__, 'ajax_upload_image'));
         add_action('wp_ajax_yxf_gallery_delete_remote_item', array(__CLASS__, 'ajax_delete_remote_item'));
+        // 保留后台 AJAX 入口，供后台环境兼容使用。
+        add_action('wp_ajax_yxf_gallery_media_frame', array(__CLASS__, 'ajax_media_iframe'));
+        // 前台 iframe 不能依赖 admin-ajax，否则普通用户会得到 WordPress 默认的“0”。
+        add_action('template_redirect', array(__CLASS__, 'frontend_media_iframe'), 0);
         add_action('admin_post_yxf_gallery_check_update', array(__CLASS__, 'check_update_now'));
         add_action('admin_notices', array(__CLASS__, 'update_check_notice'));
         add_action('admin_enqueue_scripts', array(__CLASS__, 'enqueue_media_replacement'), 999);
@@ -64,9 +68,11 @@ final class YouXianFeng_Gallery {
             attachment_id bigint(20) unsigned NOT NULL DEFAULT 0,
             status varchar(20) NOT NULL DEFAULT 'ready',
             author_id bigint(20) unsigned NOT NULL DEFAULT 0,
+            storage_owner_id bigint(20) unsigned NOT NULL DEFAULT 0,
             created_at datetime NOT NULL,
             PRIMARY KEY  (id),
             KEY author_id (author_id),
+            KEY storage_owner_id (storage_owner_id),
             KEY author_file_hash (author_id, file_hash),
             KEY attachment_id (attachment_id),
             KEY created_at (created_at)
@@ -103,6 +109,8 @@ final class YouXianFeng_Gallery {
             'api_base'        => 'https://mail.youxianfeng.com',
             'github_secret'   => '',
             'replace_media_library' => 0,
+            'shared_account_user_id' => 0,
+            'shared_account_roles' => array(),
         );
     }
 
@@ -137,6 +145,14 @@ final class YouXianFeng_Gallery {
             'sftp_remote_path' => '/' . ltrim(trim((string) wp_unslash($_POST['sftp_remote_path'] ?? '')), '/'),
             'api_base'         => untrailingslashit(esc_url_raw(trim((string) wp_unslash($_POST['api_base'] ?? '')))),
         ));
+        $shared_owner_id = absint($_POST['shared_account_user_id'] ?? 0);
+        $requested_roles = isset($_POST['shared_account_roles']) && is_array($_POST['shared_account_roles'])
+            ? array_map('sanitize_key', wp_unslash($_POST['shared_account_roles']))
+            : array();
+        $shared_roles = array_values(array_intersect(array('subscriber', 'contributor'), $requested_roles));
+        // 只能选择一个已经独立保存过邮箱登录信息的站内用户作为共享账号。
+        $settings['shared_account_user_id'] = ($shared_owner_id && get_userdata($shared_owner_id) && self::user_has_own_login($shared_owner_id)) ? $shared_owner_id : 0;
+        $settings['shared_account_roles'] = $settings['shared_account_user_id'] ? $shared_roles : array();
         // 账号和密码只能属于具体用户，禁止再写入网站全局设置。
         unset($settings['sftp_username'], $settings['sftp_secret'], $settings['api_username']);
         return $settings;
@@ -219,10 +235,12 @@ final class YouXianFeng_Gallery {
             plugin_dir_url(__FILE__) . 'assets/media-replacement.js',
             $dependencies,
             is_file($asset_path) ? (string) filemtime($asset_path) : self::VERSION,
-            true
+            // 前台须在子比编辑器初始化前加载，才能让图片和附件对象从一开始使用图库。
+            false
         );
         wp_localize_script('yxf-gallery-media-replacement', 'YXFGalleryReplacement', array(
-            'iframeUrl' => admin_url('media-upload.php'),
+            // 前台统一使用站点自身地址，不触发 wp-admin 的权限和 AJAX 默认响应。
+            'iframeUrl' => home_url('/'),
             'loginUrl'  => self::login_url(),
             'hasLogin'  => self::user_has_login(),
             'enabled'   => true,
@@ -308,8 +326,47 @@ final class YouXianFeng_Gallery {
         );
     }
 
-    private static function storage_settings_for_user($user_id = 0) {
+    private static function user_has_own_login($user_id = 0) {
         $account = self::account($user_id);
+        return $account['username'] !== '' && self::decrypt_secret($account['secret']) !== '';
+    }
+
+    /** 当前用户没有自有账号时，按后台授权的角色使用指定的共享账号。 */
+    private static function shared_account_owner_for_user($user_id = 0) {
+        $user_id = absint($user_id ?: get_current_user_id());
+        if (!$user_id || self::user_has_own_login($user_id)) {
+            return 0;
+        }
+        $settings = self::settings();
+        $owner_id = absint($settings['shared_account_user_id'] ?? 0);
+        $roles = array_intersect(
+            array('subscriber', 'contributor'),
+            array_map('sanitize_key', (array) ($settings['shared_account_roles'] ?? array()))
+        );
+        $user = get_userdata($user_id);
+        if (!$owner_id || !$roles || !$user || !array_intersect($roles, (array) $user->roles)) {
+            return 0;
+        }
+        return self::user_has_own_login($owner_id) ? $owner_id : 0;
+    }
+
+    private static function effective_account_owner_id($user_id = 0) {
+        $user_id = absint($user_id ?: get_current_user_id());
+        if (!$user_id) {
+            return 0;
+        }
+        return self::user_has_own_login($user_id) ? $user_id : self::shared_account_owner_for_user($user_id);
+    }
+
+    private static function is_using_shared_account($user_id = 0) {
+        $user_id = absint($user_id ?: get_current_user_id());
+        $owner_id = self::effective_account_owner_id($user_id);
+        return $owner_id > 0 && $owner_id !== $user_id;
+    }
+
+    private static function storage_settings_for_user($user_id = 0) {
+        $owner_id = self::effective_account_owner_id($user_id);
+        $account = $owner_id ? self::account($owner_id) : array('username' => '', 'secret' => '');
         $settings = self::settings();
         $settings['sftp_username'] = $account['username'];
         $settings['api_username'] = $account['username'];
@@ -317,8 +374,7 @@ final class YouXianFeng_Gallery {
     }
 
     private static function user_has_login($user_id = 0) {
-        $account = self::account($user_id);
-        return $account['username'] !== '' && self::decrypt_secret($account['secret']) !== '';
+        return self::effective_account_owner_id($user_id) > 0;
     }
 
     private static function login_url() {
@@ -671,7 +727,8 @@ final class YouXianFeng_Gallery {
 
     /** 远端文件先成功删除，才清理网站中的记录和虚拟媒体。 */
     private static function delete_item_with_remote_file($item) {
-        list($settings, $password) = self::storage_settings_for_user((int) $item->author_id);
+        $storage_owner_id = absint($item->storage_owner_id ?? 0) ?: (int) $item->author_id;
+        list($settings, $password) = self::storage_settings_for_user($storage_owner_id);
         $deleted = self::delete_remote_file_via_api($settings, $password, (string) $item->remote_path);
         if (is_wp_error($deleted)) {
             return $deleted;
@@ -1016,9 +1073,10 @@ final class YouXianFeng_Gallery {
             }
             return array('item' => $existing, 'duplicate' => true);
         }
-        list($settings, $password) = self::storage_settings_for_user();
+        $storage_owner_id = self::effective_account_owner_id();
+        list($settings, $password) = self::storage_settings_for_user($storage_owner_id);
         if ($password === '') {
-            return new WP_Error('login_required', '请先在“登录”中保存自己的游先锋邮箱账号和密码。');
+            return new WP_Error('login_required', '请先登录游先锋邮箱，或请管理员为你的用户角色配置默认图库账号。');
         }
         $remote_file = gmdate('Ymd-His') . '-' . wp_generate_password(8, false, false) . '-' . $file_name;
         $uploaded = self::storage_upload($settings, $password, $tmp_name, $remote_file);
@@ -1045,8 +1103,9 @@ final class YouXianFeng_Gallery {
             'file_size'    => max(0, $file_size),
             'status'       => $is_ready ? 'ready' : 'pending',
             'author_id'    => get_current_user_id(),
+            'storage_owner_id' => $storage_owner_id,
             'created_at'   => current_time('mysql'),
-        ), array('%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%d', '%s'));
+        ), array('%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%d', '%d', '%s'));
         if (!$wpdb->insert_id) {
             return new WP_Error('record_failed', '图片已上传，但图库记录保存失败，请不要重复上传并联系管理员。');
         }
@@ -1323,12 +1382,13 @@ final class YouXianFeng_Gallery {
         $current_page = min($current_page, $total_pages);
         $items = $wpdb->get_results($wpdb->prepare("SELECT * FROM " . self::table_name() . " WHERE author_id = %d ORDER BY id DESC LIMIT %d OFFSET %d", get_current_user_id(), $per_page, ($current_page - 1) * $per_page));
         $account = self::account();
+        $using_shared_account = self::is_using_shared_account();
         ?>
         <div class="wrap yxf-gallery-wrap">
             <h1>我的媒体库</h1>
             <?php self::notices(); ?>
-            <p><a class="button button-primary" href="<?php echo esc_url(admin_url('admin.php?page=yxf-gallery-upload')); ?>">上传图片</a> <?php if (self::user_has_login()) : ?><a class="button-link" style="color:#00a32a;font-weight:600;text-decoration:none" href="<?php echo esc_url(admin_url('admin.php?page=yxf-gallery-login')); ?>">已登陆：<?php echo esc_html($account['username']); ?></a><?php else : ?><a class="button" href="<?php echo esc_url(admin_url('admin.php?page=yxf-gallery-login')); ?>">登录游先锋邮箱</a><?php endif; ?></p>
-            <p class="description">这里仅显示你上传到自己游先锋邮箱网盘的媒体文件。</p>
+            <p><a class="button button-primary" href="<?php echo esc_url(admin_url('admin.php?page=yxf-gallery-upload')); ?>">上传图片</a> <?php if (self::user_has_login()) : ?><?php if ($using_shared_account) : ?><span style="color:#00a32a;font-weight:600">正在使用管理员配置的默认图库账号</span><?php else : ?><a class="button-link" style="color:#00a32a;font-weight:600;text-decoration:none" href="<?php echo esc_url(admin_url('admin.php?page=yxf-gallery-login')); ?>">已登录：<?php echo esc_html($account['username']); ?></a><?php endif; ?><?php else : ?><a class="button" href="<?php echo esc_url(admin_url('admin.php?page=yxf-gallery-login')); ?>">登录游先锋邮箱</a><?php endif; ?></p>
+            <p class="description">这里仅显示你上传的媒体文件；使用默认图库账号时，文件实际保存到管理员指定的共享网盘。</p>
             <?php if (!$items) : ?>
                 <div class="notice notice-info inline"><p>图库暂无媒体文件。请先上传一个文件。</p></div>
             <?php else : ?>
@@ -1374,7 +1434,7 @@ final class YouXianFeng_Gallery {
         <div class="wrap">
             <h1>上传图片</h1>
             <?php self::notices(); ?>
-            <?php if (!self::user_has_login()) : ?><div class="notice notice-warning inline"><p>请先在“登录”中填写你自己的游先锋邮箱账号，媒体只会上传到该账号的网盘。<a href="<?php echo esc_url(admin_url('admin.php?page=yxf-gallery-login')); ?>">去登录</a></p></div><?php endif; ?>
+            <?php if (!self::user_has_login()) : ?><div class="notice notice-warning inline"><p>请先在“登录”中填写自己的游先锋邮箱账号，或请管理员为你的用户角色配置默认图库账号。<a href="<?php echo esc_url(admin_url('admin.php?page=yxf-gallery-login')); ?>">去登录</a></p></div><?php endif; ?>
             <div class="card yxf-upload-card" style="max-width:900px;padding:22px;margin-top:18px">
                 <p>选择图片后会先进入上传队列。每张相同图片只会上传一次，可继续选择更多图片加入队列。</p>
                 <input id="yxf-gallery-files" type="file" accept="image/*" multiple class="screen-reader-text" <?php disabled(!self::user_has_login()); ?>>
@@ -1412,7 +1472,7 @@ final class YouXianFeng_Gallery {
         <div class="wrap">
             <h1>登录游先锋邮箱</h1>
             <?php self::notices(); ?>
-            <div class="notice notice-info inline"><p>账号信息只保存到你自己的用户资料中，其他作者、编辑和管理员都不会使用你的网盘账号上传图片。</p></div>
+            <div class="notice notice-info inline"><p><?php echo self::is_using_shared_account() ? '你当前可使用管理员配置的默认图库账号上传图片。你也可以填写自己的账号；保存后会优先使用自己的网盘。' : '账号信息只保存到你自己的用户资料中。若管理员为普通用户或贡献者配置了默认图库账号，符合条件的用户可使用该账号上传，但不会看到账号密码。'; ?></p></div>
             <form method="post" class="card" style="max-width:720px;padding:18px 22px;margin-top:18px">
                 <?php wp_nonce_field('yxf_gallery_login'); ?>
                 <table class="form-table" role="presentation">
@@ -1547,6 +1607,12 @@ final class YouXianFeng_Gallery {
             wp_die('无权访问图库设置。');
         }
         $settings = self::settings();
+        $shared_account_users = array();
+        foreach (get_users(array('orderby' => 'display_name', 'order' => 'ASC')) as $user) {
+            if (self::user_has_own_login((int) $user->ID)) {
+                $shared_account_users[] = $user;
+            }
+        }
         ?>
         <div class="wrap">
             <h1>游先锋图库设置</h1>
@@ -1557,7 +1623,21 @@ final class YouXianFeng_Gallery {
                 <table class="form-table" role="presentation">
                     <tr>
                         <th scope="row">替换媒体库</th>
-                        <td><label><input type="checkbox" name="replace_media_library" value="1" <?php checked(!empty($settings['replace_media_library'])); ?>> 启用游先锋图库替换媒体库</label><p class="description">启用后，WordPress、子比主题和使用标准媒体接口的日主题，都会将图片、视频、音频和普通附件的选择、上传入口改为游先锋图库；原文件始终保存在用户自己的游先锋邮箱网盘。</p></td>
+                        <td><label><input type="checkbox" name="replace_media_library" value="1" <?php checked(!empty($settings['replace_media_library'])); ?>> 启用游先锋图库替换媒体库</label><p class="description">启用后，WordPress、子比主题和使用标准媒体接口的日主题，都会将图片、视频、音频和普通附件的选择、上传入口改为游先锋图库；原文件保存在用户自己的网盘，或管理员指定的默认图库账号中。</p></td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="shared_account_user_id">前台默认图库账号</label></th>
+                        <td>
+                            <select id="shared_account_user_id" name="shared_account_user_id">
+                                <option value="0">不启用（用户需自行登录）</option>
+                                <?php foreach ($shared_account_users as $user) : ?><option value="<?php echo absint($user->ID); ?>" <?php selected((int) $settings['shared_account_user_id'], (int) $user->ID); ?>><?php echo esc_html($user->display_name ?: $user->user_login); ?>（站内账号：<?php echo esc_html($user->user_login); ?>）</option><?php endforeach; ?>
+                            </select>
+                            <?php if (!$shared_account_users) : ?><p class="description" style="color:#b32d2e">暂无可选账号。请先让一个站内用户在“游先锋图库 → 登录”中保存并测试自己的邮箱登录信息。</p><?php endif; ?>
+                            <p style="margin:10px 0 4px"><strong>允许使用该账号的用户角色</strong></p>
+                            <label style="margin-right:16px"><input type="checkbox" name="shared_account_roles[]" value="subscriber" <?php checked(in_array('subscriber', (array) $settings['shared_account_roles'], true)); ?>> 普通用户</label>
+                            <label><input type="checkbox" name="shared_account_roles[]" value="contributor" <?php checked(in_array('contributor', (array) $settings['shared_account_roles'], true)); ?>> 贡献者</label>
+                            <p class="description">只有未设置个人邮箱账号、且角色被勾选的用户会使用此账号。密码不会发送到浏览器或显示给用户；图片记录仍归实际上传者所有，用户只能查看和管理自己的图片。</p>
+                        </td>
                     </tr>
                     <tr>
                         <th scope="row">自定义媒体域名</th>
@@ -1574,7 +1654,7 @@ final class YouXianFeng_Gallery {
                 </table>
                 <hr>
                 <h2>存储连接</h2>
-                <p>这里配置全站共用的游先锋邮箱服务器地址和图片目录。每个用户的用户名、密码均在“登录”菜单中单独保存，只用于其自己的网盘。</p>
+                <p>这里配置全站共用的游先锋邮箱服务器地址和图片目录。每个用户的用户名、密码均在“登录”菜单中单独保存；启用默认图库账号后，已授权的前台用户可使用该账号上传。</p>
                 <table class="form-table" role="presentation">
                     <tr>
                         <th scope="row"><label for="storage_protocol">协议</label></th>
@@ -1594,7 +1674,7 @@ final class YouXianFeng_Gallery {
                     </tr>
                 </table>
                 <h3>公开链接接口</h3>
-                <p>媒体上传后，插件会用各自登录的游先锋邮箱账号为文件开启公开访问并取得链接。</p>
+                <p>媒体上传后，插件会用用户自己的账号或管理员指定的默认图库账号为文件开启公开访问并取得链接。</p>
                 <table class="form-table" role="presentation">
                     <tr>
                         <th scope="row"><label for="api_base">网页接口地址</label></th>
@@ -1631,6 +1711,40 @@ final class YouXianFeng_Gallery {
 
     public static function media_iframe() {
         wp_iframe(array(__CLASS__, 'render_media_iframe'));
+    }
+
+    /** 前台和后台共用的图库窗口；admin-ajax 不要求普通用户进入 wp-admin。 */
+    public static function ajax_media_iframe() {
+        if (!self::can_use_gallery()) {
+            status_header(403);
+            wp_die('无权访问图库。');
+        }
+        nocache_headers();
+        wp_iframe(array(__CLASS__, 'render_media_iframe'));
+    }
+
+    /** 前台独立窗口：不进入 wp-admin 或 admin-ajax，避免普通用户收到默认“0”响应。 */
+    public static function frontend_media_iframe() {
+        if (empty($_GET['yxf_gallery_frame'])) {
+            return;
+        }
+        nocache_headers();
+        if (!is_user_logged_in()) {
+            status_header(403);
+            wp_die('请先登录网站后再上传图片。');
+        }
+        if (!self::can_use_gallery()) {
+            status_header(403);
+            wp_die('你的账户暂未获得图库上传权限，请联系管理员。');
+        }
+        // 此页面本身就是 iframe 内容，不能调用仅后台可用的 wp_iframe()。
+        // 直接输出插件的独立窗口，普通前台用户也能正常使用。
+        status_header(200);
+        header('Content-Type: text/html; charset=' . get_option('blog_charset'));
+        echo '<!doctype html><html lang="zh-CN"><head><meta charset="' . esc_attr(get_option('blog_charset')) . '"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body>';
+        self::render_media_iframe();
+        echo '</body></html>';
+        exit;
     }
 
     public static function render_media_iframe() {
@@ -1793,6 +1907,9 @@ final class YouXianFeng_Gallery {
                 var item = {id:Number(data.id || 0), attachmentId:Number(data.attachmentId || 0), name:data.name || '图片', url:data.url, mime:data.mime || 'image/*', kind:data.kind || 'image', authorId:currentUser, createdAt:data.createdAt || ''};
                 if (!items.some(function(existing){ return existing.id === item.id; })) items.unshift(item);
                 if (!uploadedItems.some(function(existing){ return existing.id === item.id; })) uploadedItems.unshift(item);
+                if (window.parent && window.parent !== window) {
+                    window.parent.postMessage({type:'yxf_gallery_uploaded', item:item}, window.location.origin);
+                }
                 render(); renderUploadedThumbs();
             };
             var uploadOne = async function(entry){
