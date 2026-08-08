@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 游先锋图库
  * Description: 将媒体上传至游先锋邮箱存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 1.0.3
+ * Version: 1.0.4
  * Update URI: https://github.com/summer0607/youxianfeng-gallery
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '1.0.3';
+    const VERSION = '1.0.4';
     const GITHUB_REPOSITORY = 'summer0607/youxianfeng-gallery';
     const RELEASE_ASSET = 'youxianfeng-gallery.zip';
     const UPDATE_CACHE_KEY = 'yxf_gallery_github_release';
@@ -204,6 +204,25 @@ final class YouXianFeng_Gallery {
 
     private static function can_use_gallery() {
         return current_user_can(self::CAPABILITY) || current_user_can('manage_options');
+    }
+
+    /**
+     * 前台图库与子比主题共用当前用户的图片上传上限（单位：MB）。
+     * 子比未启用时保留 1MB 的安全默认值，避免普通用户上传无上限的大图。
+     */
+    private static function front_image_upload_limit_mb() {
+        $limit = 1;
+        if (function_exists('zib_get_current_user_can_number')) {
+            $theme_limit = absint(zib_get_current_user_can_number('upload_img_size', $limit));
+            if ($theme_limit > 0) {
+                $limit = $theme_limit;
+            }
+        }
+        return $limit;
+    }
+
+    private static function front_image_upload_limit_bytes() {
+        return self::front_image_upload_limit_mb() * MB_IN_BYTES;
     }
 
     private static function can_administer() {
@@ -1135,6 +1154,11 @@ final class YouXianFeng_Gallery {
             return new WP_Error('upload_error', '请选择有效的图片文件。');
         }
 
+        $limit_mb = self::front_image_upload_limit_mb();
+        if ((int) $file['size'] > self::front_image_upload_limit_bytes()) {
+            return new WP_Error('too_large', sprintf('图片大小超过当前上传权限限制，最大 %sMB，请重新选择。', $limit_mb));
+        }
+
         return self::upload_local_image_file((string) $file['tmp_name'], (string) $file['name'], (int) $file['size']);
     }
 
@@ -1613,13 +1637,15 @@ final class YouXianFeng_Gallery {
         if (!self::can_use_gallery()) {
             wp_die('无权上传图库图片。');
         }
+        $max_upload_mb = self::front_image_upload_limit_mb();
+        $max_upload_bytes = self::front_image_upload_limit_bytes();
         ?>
         <div class="wrap">
             <h1>上传图片</h1>
             <?php self::notices(); ?>
             <?php if (!self::user_has_login()) : ?><div class="notice notice-warning inline"><p>请先在“登录”中填写自己的游先锋邮箱账号，或请管理员为你的用户角色配置默认图库账号。<a href="<?php echo esc_url(admin_url('admin.php?page=yxf-gallery-login')); ?>">去登录</a></p></div><?php endif; ?>
             <div class="card yxf-upload-card" style="max-width:900px;padding:22px;margin-top:18px">
-                <p>选择图片后会先进入上传队列。每张相同图片只会上传一次，可继续选择更多图片加入队列。</p>
+                <p>选择图片后会先进入上传队列。单张最大 <?php echo esc_html($max_upload_mb); ?>MB；每张相同图片只会上传一次，可继续选择更多图片加入队列。</p>
                 <input id="yxf-gallery-files" type="file" accept="image/*" multiple class="screen-reader-text" <?php disabled(!self::user_has_login()); ?>>
                 <p class="yxf-upload-actions"><button type="button" class="button" id="yxf-gallery-choose" <?php disabled(!self::user_has_login()); ?>>选择图片</button> <button type="button" class="button button-primary" id="yxf-gallery-start" disabled>开始上传</button></p>
                 <ul class="yxf-upload-queue" id="yxf-gallery-queue" aria-live="polite"></ul>
@@ -1633,11 +1659,11 @@ final class YouXianFeng_Gallery {
         (function(){
             var input=document.getElementById('yxf-gallery-files'), choose=document.getElementById('yxf-gallery-choose'), start=document.getElementById('yxf-gallery-start'), list=document.getElementById('yxf-gallery-queue'), links=document.getElementById('yxf-gallery-links');
             if(!input||!choose||!start||!list||!links){return;}
-            var queue=new Map(), uploading=false, ajaxUrl=<?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>, nonce=<?php echo wp_json_encode(wp_create_nonce('yxf_gallery_upload')); ?>;
+            var queue=new Map(), uploading=false, maxUploadBytes=<?php echo (int) $max_upload_bytes; ?>, maxUploadLabel=<?php echo wp_json_encode((string) $max_upload_mb . 'MB'); ?>, ajaxUrl=<?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>, nonce=<?php echo wp_json_encode(wp_create_nonce('yxf_gallery_upload')); ?>;
             function key(file){return [file.name,file.size,file.lastModified].join(':');}
             function copy(url,button){var done=function(){button.textContent='已复制';window.setTimeout(function(){button.textContent='复制链接';},1500);};if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(url).then(done).catch(function(){window.prompt('请复制图片链接：',url);});}else{window.prompt('请复制图片链接：',url);}}
             function render(){list.innerHTML='';links.innerHTML='';var completed=[];queue.forEach(function(item,id){var row=document.createElement('li');row.className='yxf-upload-item is-'+item.state;row.innerHTML='<span class="yxf-upload-item-name"></span><span class="yxf-upload-item-status"></span>';row.querySelector('.yxf-upload-item-name').textContent=item.file.name;row.querySelector('.yxf-upload-item-status').textContent=item.message;if(item.state==='waiting'||item.state==='error'){var remove=document.createElement('button');remove.type='button';remove.className='yxf-upload-item-remove';remove.textContent='移除';remove.addEventListener('click',function(){queue.delete(id);render();});row.appendChild(remove);}if(item.state==='success'&&item.url){completed.push(item);}list.appendChild(row);});if(completed.length){var title=document.createElement('p');title.className='yxf-upload-links-title';title.textContent='图片外部链接';links.appendChild(title);completed.forEach(function(item){var row=document.createElement('div');row.className='yxf-upload-link-row';var name=document.createElement('strong');name.className='yxf-upload-link-name';name.title=item.file.name;name.textContent=item.file.name;var url=document.createElement('a');url.className='yxf-upload-link-url';url.href=item.url;url.target='_blank';url.rel='noopener';url.title=item.url;url.textContent=item.url;var copyButton=document.createElement('button');copyButton.type='button';copyButton.className='yxf-upload-copy';copyButton.textContent='复制链接';copyButton.addEventListener('click',function(){copy(item.url,copyButton);});row.append(name,url,copyButton);links.appendChild(row);});}start.disabled=uploading||![...queue.values()].some(function(item){return item.state==='waiting'||item.state==='error';});}
-            function add(files){Array.prototype.forEach.call(files,function(file){if(!file.type.match(/^image\//)){return;}var id=key(file);if(!queue.has(id)){queue.set(id,{file:file,state:'waiting',message:'等待上传'});}});input.value='';render();}
+            function add(files){var oversized=[];Array.prototype.forEach.call(files,function(file){if(!file.type.match(/^image\//)){return;}if(file.size>maxUploadBytes){oversized.push(file.name);return;}var id=key(file);if(!queue.has(id)){queue.set(id,{file:file,state:'waiting',message:'等待上传'});}});if(oversized.length){window.alert('以下图片超过 '+maxUploadLabel+'，未加入上传队列：'+oversized.join('、'));}input.value='';render();}
             function waitForPublicLink(item,itemId){var attempt=0;function check(){attempt++;var data=new FormData();data.append('action','yxf_gallery_resolve_pending_item');data.append('nonce',nonce);data.append('item_id',itemId);fetch(ajaxUrl,{method:'POST',body:data,credentials:'same-origin'}).then(function(response){return response.text();}).then(function(raw){var payload;try{payload=JSON.parse(raw);}catch(error){throw new Error('服务器未返回有效的链接状态。');}if(!payload.success){throw new Error((payload.data&&payload.data.message)||'公开链接检查失败。');}var result=payload.data||{};if(result.url){item.url=result.url;item.state='success';item.message='上传完成';render();return;}item.message=result.warning||'已上传，公开链接正在生成';if(attempt<30){window.setTimeout(check,1500);}else{item.state='pending';item.message='已上传，公开链接仍在生成，可稍后在我的媒体库查看';}render();}).catch(function(){if(attempt<30){window.setTimeout(check,1500);}else{item.state='pending';item.message='已上传，公开链接仍在生成，可稍后在我的媒体库查看';render();}});}window.setTimeout(check,1200);}
             async function send(item){item.state='uploading';item.message='正在上传…';render();var data=new FormData();data.append('action','yxf_gallery_upload_image');data.append('nonce',nonce);data.append('gallery_file',item.file,item.file.name);try{var response=await fetch(ajaxUrl,{method:'POST',body:data,credentials:'same-origin'}),raw=await response.text(),payload;try{payload=JSON.parse(raw);}catch(parseError){throw new Error('服务器未返回有效的上传结果，请重新登录游先锋邮箱后再试。');}if(!payload.success){throw new Error((payload.data&&payload.data.message)||'上传失败，请重试。');}var result=payload.data||{};item.url=result.url||'';if(item.url){item.state='success';item.message=result.duplicate?'已存在，无需重复上传':'上传完成';}else{item.state='pending';item.message=result.warning||'已上传，公开链接正在生成';waitForPublicLink(item,result.id);} }catch(error){item.state='error';item.message=error.message||'上传失败，请重试。';}render();}
             async function run(){if(uploading){return;}uploading=true;render();for(const item of queue.values()){if(item.state==='waiting'||item.state==='error'){await send(item);}}uploading=false;render();}
@@ -1968,6 +1994,8 @@ final class YouXianFeng_Gallery {
         $post_id = absint($_REQUEST['post_id'] ?? 0);
         $callback = sanitize_key(wp_unslash($_REQUEST['yxf_gallery_callback'] ?? ''));
         $multiple = max(1, absint($_REQUEST['yxf_gallery_multiple'] ?? 1));
+        $max_upload_mb = self::front_image_upload_limit_mb();
+        $max_upload_bytes = self::front_image_upload_limit_bytes();
         $raw_requested_type = $_REQUEST['yxf_gallery_type'] ?? 'all';
         $requested_type = is_string($raw_requested_type) ? sanitize_key(wp_unslash($raw_requested_type)) : 'all';
         $requested_type = in_array($requested_type, array('image', 'video', 'audio', 'file', 'all'), true) ? $requested_type : 'all';
@@ -2010,7 +2038,7 @@ final class YouXianFeng_Gallery {
                 <section class="yxf-media-panel yxf-upload-panel <?php echo $active_tab === 'upload' ? 'is-active' : ''; ?>" data-yxf-panel="upload">
                     <div class="yxf-upload-box">
                         <h2>上传图片到游先锋图库</h2>
-                        <p class="yxf-upload-hint">仅支持上传 1MB 以内的图片，建议使用 WebP 格式。<a class="yxf-format-guide" href="https://tinypng.com/" target="_blank" rel="noopener">免费转格式 <span aria-hidden="true">↗</span></a></p>
+                        <p class="yxf-upload-hint">仅支持上传 <?php echo esc_html($max_upload_mb); ?>MB 以内的图片，建议使用 WebP 格式。<a class="yxf-format-guide" href="https://tinypng.com/" target="_blank" rel="noopener">免费转格式 <span aria-hidden="true">↗</span></a></p>
                         <?php self::notices(); ?>
                         <?php if (!self::user_has_login()) : ?><div class="notice notice-warning inline"><p>请先在后台“游先锋图库 → 登录”中填写你自己的游先锋邮箱账号。</p></div><?php endif; ?>
                         <input id="yxf-frame-files" type="file" accept="image/*" multiple class="yxf-hidden" <?php disabled(!self::user_has_login()); ?>>
@@ -2040,6 +2068,8 @@ final class YouXianFeng_Gallery {
             var selectionLimit = <?php echo (int) $multiple; ?>;
             var requestedType = <?php echo wp_json_encode($requested_type); ?>;
             var currentUser = <?php echo (int) get_current_user_id(); ?>;
+            var maxUploadBytes = <?php echo (int) $max_upload_bytes; ?>;
+            var maxUploadLabel = <?php echo wp_json_encode((string) $max_upload_mb . 'MB'); ?>;
             var active = null;
             var selectedItems = [];
             var frame = document.getElementById('yxf-media-frame');
@@ -2139,8 +2169,8 @@ final class YouXianFeng_Gallery {
             };
             var addUploadFiles = function(files){
                 var oversized = [];
-                Array.prototype.forEach.call(files || [], function(file){ if (!file.type || !file.type.match(/^image\//)) return; if (file.size > 1024 * 1024) { oversized.push(file.name); return; } var id = uploadKey(file); if (!uploadItems.has(id)) uploadItems.set(id, {file:file, state:'waiting', message:'等待上传'}); });
-                if (oversized.length) window.alert('以下图片超过 1MB，未加入上传队列：' + oversized.join('、'));
+                Array.prototype.forEach.call(files || [], function(file){ if (!file.type || !file.type.match(/^image\//)) return; if (file.size > maxUploadBytes) { oversized.push(file.name); return; } var id = uploadKey(file); if (!uploadItems.has(id)) uploadItems.set(id, {file:file, state:'waiting', message:'等待上传'}); });
+                if (oversized.length) window.alert('以下图片超过 ' + maxUploadLabel + '，未加入上传队列：' + oversized.join('、'));
                 uploadInput.value = ''; renderUploadQueue();
             };
             var addUploadedItem = function(data){
