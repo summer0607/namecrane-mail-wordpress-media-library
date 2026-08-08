@@ -35,7 +35,13 @@
     // 图库 iframe 上传完成后，同步更新仍在背后的子比“我的图片/我的文件”列表。
     // 这样用户取消返回主题窗口时，也能立即看到刚上传的新文件，无需刷新页面。
     window.addEventListener('message', function (event) {
-        if (event.origin !== window.location.origin || !event.data || event.data.type !== 'yxf_gallery_uploaded') return;
+        if (event.origin !== window.location.origin || !event.data) return;
+        if (event.data.type === 'yxf_gallery_insert') {
+            var callback = callbacks[event.data.callbackKey];
+            if (typeof callback === 'function') callback(event.data.items || []);
+            return;
+        }
+        if (event.data.type !== 'yxf_gallery_uploaded') return;
         var item = event.data.item || {};
         var id = Number(item.attachmentId || 0);
         var url = String(item.url || '');
@@ -317,12 +323,20 @@
         var $element = $(element);
         var $field = $element.closest('.csf-field,.csf-fieldset,.widget_ui_slider_g,td,form,label');
         if (!$field.length) $field = $element.parent();
+        // “地址输入框 + 上传按钮”不总是使用 Codestar 的固定类名。
+        // 优先限定在同一个控件组中，避免误填同一页面里其他设置项的文字输入框。
+        var urlSelector = '.csf--url,input[type="url"],input[type="text"][name*="url"],input[type="text"][name*="link"],input[type="text"][name*="src"],input[type="hidden"][name*="url"],input[type="hidden"][name*="link"],input[type="hidden"][name*="src"]';
+        var $urlScope = $element.closest('.csf-field,.csf-fieldset,.widget_ui_slider_g,.input-group,.form-group,.form-field,.media-upload,.upload-wrap,.upload-box,td,label');
+        if (!$urlScope.length) $urlScope = $field;
+        var $linkedUrlInput = $urlScope.find(urlSelector).not('[type="file"]').first();
+        if (!$linkedUrlInput.length) $linkedUrlInput = $element.siblings(urlSelector).not('[type="file"]').first();
 
         // 子比 Codestar 字段：地址、ID、缩略图和预览与其原本的选择逻辑保持同样的字段结构。
-        $field.find('.csf--url,.csf--wrap input[type="text"]').first().val(item.url).trigger('change');
+        $field.find('.csf--url,.csf--wrap input[type="text"]').first().val(item.url).trigger('input').trigger('change');
         $field.find('.csf--id').val(item.attachmentId || 0).trigger('change');
         $field.find('.csf--thumbnail').val(item.url).trigger('change');
         $field.find('.csf--title').val(item.name || '').trigger('change');
+        if ($linkedUrlInput.length) $linkedUrlInput.val(item.url).trigger('input').trigger('change');
 
         // 子比小工具、分类封面及常规“选择图片”按钮。
         if ($element.hasClass('ashu_upload_button')) {
@@ -337,8 +351,7 @@
         if ($file.length) {
             $file.attr('data-yxf-gallery-url', item.url).attr('data-yxf-gallery-attachment', item.attachmentId || 0).trigger('yxf_gallery_selected', [item, items]);
             // 表单若预留了地址字段，则直接填入，避免再写入网站 uploads。
-            var $urlInput = $field.find('input[type="url"],input[type="text"][name*="url"],input[type="hidden"][name*="url"]').first();
-            if ($urlInput.length) $urlInput.val(item.url).trigger('change');
+            if ($linkedUrlInput.length) $linkedUrlInput.val(item.url).trigger('input').trigger('change');
         }
         updatePreview($field, item);
         updateThemeUploadPreview(element, items);
@@ -440,7 +453,7 @@
     }
 
     $(observeMediaFrames);
-    $('<style id="yxf-gallery-overlay-style">#yxf-gallery-overlay{position:fixed;z-index:999999;inset:0;background:rgba(0,0,0,.48);display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}#yxf-gallery-overlay .yxf-gallery-overlay-panel{position:relative;width:min(960px,100%);height:min(700px,100%);background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 12px 36px rgba(0,0,0,.32)}#yxf-gallery-overlay iframe{display:block;width:100%;height:100%;border:0}.yxf-gallery-overlay-close{position:absolute;z-index:1;right:10px;top:8px;border:0;background:rgba(0,0,0,.45);color:#fff;width:30px;height:30px;border-radius:50%;font-size:22px;line-height:28px;cursor:pointer}@media(max-width:782px){#yxf-gallery-overlay{padding:0}#yxf-gallery-overlay .yxf-gallery-overlay-panel{width:100%;height:100%;border-radius:0}}</style>').appendTo('head');
+    $('<style id="yxf-gallery-overlay-style">#yxf-gallery-overlay{position:fixed;z-index:999999;inset:0;background:rgba(0,0,0,.48);display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}#yxf-gallery-overlay .yxf-gallery-overlay-panel{position:relative;width:min(960px,100%);height:min(700px,100%);background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 12px 36px rgba(0,0,0,.32)}#yxf-gallery-overlay iframe{display:block;width:100%;height:100%;border:0}.yxf-gallery-overlay-close{position:absolute;z-index:1;right:10px;top:8px;display:grid;place-items:center;margin:0;padding:0;border:0;background:rgba(0,0,0,.45);color:#fff;width:32px;height:32px;border-radius:50%;font-family:Arial,sans-serif;font-size:25px;font-weight:300;line-height:1;cursor:pointer}@media(max-width:782px){#yxf-gallery-overlay{padding:0}#yxf-gallery-overlay .yxf-gallery-overlay-panel{width:100%;height:100%;border-radius:0}}</style>').appendTo('head');
     patchZibMedia();
     patchWordPressMedia();
     patchWordPressEditorOpen();

@@ -90,7 +90,9 @@
         if (event.data.type === 'yxf_gallery_uploaded' && activeThemeModal && activeThemeModal.length) {
             appendGalleryItems(activeThemeModal.find('.mini-media-my-lists.type-' + activeMediaType), [event.data.item || {}]);
         } else if (event.data.type === 'yxf_gallery_insert') {
-            window.YXFGalleryInsertIntoEditor(event.data.items || []);
+            var callback = callbacks[event.data.callbackKey];
+            if (typeof callback === 'function') callback(event.data.items || []);
+            else window.YXFGalleryInsertIntoEditor(event.data.items || []);
         }
     });
 
@@ -113,14 +115,30 @@
 
     function insertItemsIntoActiveEditor(items) {
         if (!items.length) return;
-        var selected = items.map(itemData).filter(function (item) { return item.id && item.url; });
+        var selected = items.map(itemData).filter(function (item) { return item.url; });
         // 前台投稿和发帖均由子比主题自己的媒体窗口负责插入。向原窗口派发它
         // 正常“插入”按钮使用的事件，避免不同编辑器实例之间出现插入错位或丢失。
         if (activeThemeModal && activeThemeModal.length && selected.length) {
-            activeThemeModal.trigger('lists_submit', {
-                data: selected,
-                ids: selected.map(function (item) { return item.id; })
-            });
+            // 没有图库编号的是用户手动粘贴的外部链接。交给主题原有的“输入外链”
+            // 流程，图片、附件等都会被插到正确的编辑器，而不是被误认为图库文件。
+            if (selected.every(function (item) { return !item.id; })) {
+                var urls = selected.map(function (item) { return item.url; });
+                var $urlInput = activeThemeModal.find('.input-input').first();
+                var $urlSubmit = activeThemeModal.find('.input-submit').first();
+                // 模拟主题自身的“外链地址确认”操作，而不是只派发事件；不同的前台编辑器
+                // 会在该操作中保存当前光标位置，才能把外链准确插入正文。
+                if ($urlInput.length && $urlSubmit.length) {
+                    $urlInput.val(urls.join('\n'));
+                    $urlSubmit.trigger('click');
+                    return;
+                }
+                activeThemeModal.trigger('select_submit').trigger('input_submit', { vals: urls });
+            } else {
+                activeThemeModal.trigger('lists_submit', {
+                    data: selected,
+                    ids: selected.map(function (item) { return item.id; })
+                });
+            }
             activeThemeModal.modal('hide');
             return;
         }
@@ -156,6 +174,6 @@
         body.dispatchEvent(new Event('change', {bubbles: true}));
     }
 
-    $('<style id="yxf-gallery-overlay-style">#yxf-gallery-overlay{position:fixed;z-index:999999;inset:0;background:rgba(0,0,0,.48);display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}#yxf-gallery-overlay .yxf-gallery-overlay-panel{position:relative;width:min(800px,calc(100vw - 48px));height:min(580px,calc(100vh - 72px));background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 16px 42px rgba(0,0,0,.38)}#yxf-gallery-overlay iframe{display:block;width:100%;height:100%;border:0}.yxf-gallery-overlay-close{position:absolute;z-index:1;right:10px;top:8px;border:0;background:rgba(0,0,0,.45);color:#fff;width:30px;height:30px;border-radius:50%;font-size:22px;line-height:28px;cursor:pointer}@media(max-width:782px){#yxf-gallery-overlay{padding:0}#yxf-gallery-overlay .yxf-gallery-overlay-panel{width:100%;height:100%;border-radius:0}}</style>').appendTo('head');
+    $('<style id="yxf-gallery-overlay-style">#yxf-gallery-overlay{position:fixed;z-index:999999;inset:0;background:rgba(0,0,0,.48);display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}#yxf-gallery-overlay .yxf-gallery-overlay-panel{position:relative;width:min(800px,calc(100vw - 48px));height:min(580px,calc(100vh - 72px));background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 16px 42px rgba(0,0,0,.38)}#yxf-gallery-overlay iframe{display:block;width:100%;height:100%;border:0}.yxf-gallery-overlay-close{position:absolute;z-index:1;right:10px;top:8px;display:grid;place-items:center;margin:0;padding:0;border:0;background:rgba(0,0,0,.45);color:#fff;width:32px;height:32px;border-radius:50%;font-family:Arial,sans-serif;font-size:25px;font-weight:300;line-height:1;cursor:pointer}@media(max-width:782px){#yxf-gallery-overlay{padding:0}#yxf-gallery-overlay .yxf-gallery-overlay-panel{width:100%;height:100%;border-radius:0}}</style>').appendTo('head');
 
 }(jQuery, window));
