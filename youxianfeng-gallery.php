@@ -2,7 +2,7 @@
 /**
  * Plugin Name: 游先锋图库
  * Description: 将媒体上传至游先锋邮箱存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 0.5.24
+ * Version: 0.5.28
  * Update URI: https://github.com/summer0607/youxianfeng-gallery
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '0.5.24';
+    const VERSION = '0.5.28';
     const GITHUB_REPOSITORY = 'summer0607/youxianfeng-gallery';
     const RELEASE_ASSET = 'youxianfeng-gallery.zip';
     const UPDATE_CACHE_KEY = 'yxf_gallery_github_release';
@@ -167,7 +167,9 @@ final class YouXianFeng_Gallery {
     }
 
     private static function grant_capabilities() {
-        foreach (array('administrator', 'editor', 'author') as $role_name) {
+        // 论坛发帖、商城评价等前台上传入口主要面向普通已登录会员；
+        // 图库按用户隔离文件和登录信息，因此这些角色也只能操作自己的媒体。
+        foreach (array('administrator', 'editor', 'author', 'contributor', 'subscriber') as $role_name) {
             $role = get_role($role_name);
             if ($role) {
                 $role->add_cap(self::CAPABILITY);

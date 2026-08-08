@@ -23,10 +23,12 @@
 
     function closeGalleryOverlay() {
         $('#yxf-gallery-overlay').remove();
+        // 后台主题设置页的旧 Thickbox 容器会错误地固定在左下角，
+        // 并吞掉页面点击。图库改用独立遮罩前，清掉仅可能由图库留下的旧容器。
+        $('#TB_window, #TB_overlay').remove();
     }
     window.YXFGalleryClose = function () {
-        if ($('#TB_window').length && typeof window.tb_remove === 'function') window.tb_remove();
-        else closeGalleryOverlay();
+        closeGalleryOverlay();
     };
 
     function openGallery(options, callback) {
@@ -37,14 +39,12 @@
                 window.setTimeout(function () { delete callbacks[key]; }, 0);
             }
         };
-        if (typeof window.tb_show === 'function') {
-            window.tb_show('游先锋图库', galleryUrl(options || {}, key));
-        } else {
-            closeGalleryOverlay();
-            var $overlay = $('<div id="yxf-gallery-overlay" role="dialog" aria-modal="true"><div class="yxf-gallery-overlay-panel"><button type="button" class="yxf-gallery-overlay-close" aria-label="关闭">×</button><iframe title="游先锋图库" src="' + galleryUrl(options || {}, key) + '"></iframe></div></div>');
-            $overlay.on('click', '.yxf-gallery-overlay-close', function () { closeGalleryOverlay(); delete callbacks[key]; });
-            $('body').append($overlay);
-        }
+        // 不使用子比/WordPress 的 Thickbox：在后台主题功能页会出现过期的左下角面板，
+        // 且该面板会覆盖页面并导致操作失效。所有入口统一使用图库自己的居中弹窗。
+        closeGalleryOverlay();
+        var $overlay = $('<div id="yxf-gallery-overlay" role="dialog" aria-modal="true"><div class="yxf-gallery-overlay-panel"><button type="button" class="yxf-gallery-overlay-close" aria-label="关闭">×</button><iframe title="游先锋图库" src="' + galleryUrl(options || {}, key) + '"></iframe></div></div>');
+        $overlay.on('click', '.yxf-gallery-overlay-close', function () { closeGalleryOverlay(); delete callbacks[key]; });
+        $('body').append($overlay);
     }
 
     function itemData(item) {
@@ -181,10 +181,16 @@
     }
 
     function typeFromElement(element) {
-        var accept = String($(element).attr('accept') || '').toLowerCase();
+        var $element = $(element);
+        var accept = String($element.attr('accept') || '').toLowerCase();
+        var library = String($element.attr('data-library') || $element.attr('data-type') || '').toLowerCase().split(',')[0];
+        if (!library) {
+            library = String($element.closest('.csf-field,.csf-fieldset').find('.csf--button[data-library]').first().attr('data-library') || '').toLowerCase().split(',')[0];
+        }
+        if (library === 'image' || library === 'video' || library === 'audio') return library;
         if (accept.indexOf('video') !== -1) return 'video';
         if (accept.indexOf('audio') !== -1) return 'audio';
-        if (accept.indexOf('image') !== -1 || $(element).hasClass('z_upload_image_button') || $(element).hasClass('ashu_upload_button')) return 'image';
+        if (accept.indexOf('image') !== -1 || $element.hasClass('z_upload_image_button') || $element.hasClass('ashu_upload_button')) return 'image';
         return 'all';
     }
 
@@ -198,6 +204,84 @@
         if (kind === 'image') {
             $scope.find('.csf--src,.taxonomy-image,.preview img,.upload-preview img').first().attr('src', item.url);
             $scope.find('.csf--preview').removeClass('hidden');
+        }
+    }
+
+    /**
+     * 论坛快速发帖并不使用 file input，而是把图片信息写入 images[]。
+     * 直接复用它原有的数据格式，避免图库选择后又回退到主题的本地上传器。
+     */
+    function applyForumQuickUpload(element, items) {
+        var $box = $(element).closest('.quick-upload');
+        if (!$box.length || !items.length) return false;
+
+        var $preview = $box.find('.preview').first();
+        if (!$preview.length) return false;
+
+        items.forEach(function (item) {
+            var url = String(item.url || '');
+            if (!url || $preview.find('input[name="images[]"]').filter(function () { return $(this).val().indexOf(url) !== -1; }).length) return;
+
+            var payload = JSON.stringify({
+                src: url,
+                id: Number(item.attachmentId || 0),
+                full: url,
+                alt: item.name || ''
+            });
+            var $entry = $('<div class="preview-item yxf-gallery-preview-item"><img class="fit-cover" alt=""><div class="preview-remove"><svg class="ic-close" aria-hidden="true"><use xlink:href="#icon-close"></use></svg></div><input type="hidden" name="images[]" value=""></div>');
+            $entry.find('img').attr('src', url).attr('alt', item.name || '');
+            $entry.find('input').val(payload);
+            $preview.find('.add').last().before($entry);
+        });
+        return true;
+    }
+
+    /** 将图库的选择结果保存在当前表单中，供主题或扩展模块读取。 */
+    function persistGallerySelection($field, items) {
+        $field.find('input[data-yxf-gallery-selection="1"]').remove();
+        items.forEach(function (item) {
+            var attachmentId = Number(item.attachmentId || 0);
+            if (!attachmentId) return;
+            $('<input>', {
+                type: 'hidden',
+                name: 'yxf_gallery_attachment_ids[]',
+                value: attachmentId,
+                'data-yxf-gallery-selection': '1'
+            }).appendTo($field);
+        });
+    }
+
+    /**
+     * 统一更新表单预览，覆盖论坛板块/分类封面、商城评价和用户资料等
+     * 直接 file input 场景；这些入口不再触发系统文件选择器。
+     */
+    function updateThemeUploadPreview(element, items) {
+        if (!items.length) return;
+        var $element = $(element);
+        var $field = $element.closest('.form-upload,.mini-upload,form,label');
+        if (!$field.length) return;
+
+        var $file = $element.is('input[type="file"]') ? $element : $field.find('input[type="file"][zibupload="image_upload"]').first();
+        var selector = $file.attr('data-preview') || '.preview';
+        var $preview = $field.find(selector).first();
+        if (!$preview.length) return;
+
+        persistGallerySelection($field, items);
+        if (selectionLimit($file) > 1) {
+            $preview.find('.yxf-gallery-preview-item').remove();
+            $preview.find('.add').remove();
+            items.forEach(function (item) {
+                if (!item || !item.url) return;
+                var $entry = $('<div class="preview-item yxf-gallery-preview-item"><img class="fit-cover" alt=""><div class="preview-remove"><svg class="ic-close" aria-hidden="true"><use xlink:href="#icon-close"></use></svg></div></div>');
+                $entry.find('img').attr('src', item.url).attr('alt', item.name || '');
+                $preview.append($entry);
+            });
+            $preview.append('<div class="add"></div>');
+        } else {
+            var item = items[0];
+            if (!item || !item.url) return;
+            $preview.find('img').first().attr('src', item.url);
+            if (!$preview.find('img').length) $preview.html('<img class="fit-cover" alt="">').find('img').attr('src', item.url);
         }
     }
 
@@ -232,6 +316,7 @@
             if ($urlInput.length) $urlInput.val(item.url).trigger('change');
         }
         updatePreview($field, item);
+        updateThemeUploadPreview(element, items);
         $element.trigger('yxf_gallery_selected', [item, items]);
     }
 
@@ -256,14 +341,17 @@
             // 图库弹窗自身也会加载本脚本。若不排除它，点击“上传文件”标签
             // 会被误当作主题上传入口拦截，造成标签无法切换、文件无法选择。
             if (event.target.closest && event.target.closest('#yxf-media-frame')) return;
-            var raw = event.target.closest && event.target.closest('input[type="file"],[zibupload="image_upload"],.z_upload_image_button,.ashu_upload_button,.csf--button,.upload-btn,.preview .add,.preview.upload-preview');
+            if (event.target.closest && event.target.closest('.preview-remove,[data-yxf-gallery-bypass="1"]')) return;
+            var raw = event.target.closest && event.target.closest('input[type="file"][zibupload="image_upload"],input[type="file"][accept*="image"],.z_upload_image_button,.ashu_upload_button,.csf--button[data-library],.upload-btn,.preview .add,.preview.upload-preview,.form-upload .preview,.mini-upload .preview,.quick-upload .add,.quick-upload .preview');
             // 插件、主题、导入等 WordPress 系统安装页也会有 file input。
             // 它们不是媒体上传入口，绝不能被图库接管。
             var $rawCandidate = raw ? $(raw) : $();
             if ($('body').is('.plugin-install-php,.theme-install-php,.update-core-php,.import-php') ||
                 $rawCandidate.is('[name="pluginzip"],[name="themezip"],[name="import"],[name="userfile"]') ||
                 $rawCandidate.closest('form[action*="update.php"],form[action*="import.php"]').length) return;
-            if (!raw && event.target.closest) {
+            // 后台存在“上传权限”等普通导航和说明文字；只在前台以文字兜底识别上传按钮，
+            // 后台必须命中明确的媒体按钮标识，避免把设置项误开成图库。
+            if (!raw && !$('body').hasClass('wp-admin') && event.target.closest) {
                 var control = event.target.closest('button,a');
                 var label = control ? String(control.getAttribute('title') || control.getAttribute('aria-label') || control.textContent || '').replace(/\s+/g, '') : '';
                 if (control && /上传|添加(?:图像|图片)|选择(?:图像|图片)/.test(label) && !/确认|提交|保存|删除|移除/.test(label) && !$(control).is('[type="submit"],[zibupload="submit"]')) raw = control;
@@ -274,7 +362,9 @@
             event.preventDefault();
             event.stopImmediatePropagation();
             var target = galleryButtonTarget(raw);
-            openGallery({ type: typeFromElement(target), multiple: selectionLimit(target) }, function (items) {
+            var isForumQuickUpload = $(raw).closest('.quick-upload').length > 0;
+            openGallery({ type: isForumQuickUpload ? 'image' : typeFromElement(target), multiple: isForumQuickUpload ? 9 : selectionLimit(target) }, function (items) {
+                if (applyForumQuickUpload(raw, items)) return;
                 applyThemeSelection(raw, items);
                 if (target !== raw) applyThemeSelection(target, items);
             });
