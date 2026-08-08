@@ -345,11 +345,8 @@
         $element.trigger('yxf_gallery_selected', [item, items]);
     }
 
-    // 子比前台编辑器已经创建好的旧媒体窗口，无法接收后来替换脚本的回传事件。
-    // 此时直接写入编辑器并关闭旧窗口，图片和附件都无需刷新“我的图片/我的文件”。
-    function insertIntoZibEditor(element, items) {
-        var $modal = $(element).closest('.modal');
-        if (!$modal.length || !$modal.find('.mini-media-my-box').length || !items.length) return false;
+    function insertItemsIntoActiveEditor(items) {
+        if (!items.length) return false;
         var editor = window.tinymce && window.tinymce.activeEditor;
         if (!editor || !editor.insertContent) return false;
         var html = items.map(function (item) {
@@ -362,6 +359,15 @@
         }).join('') + '<p></p>';
         editor.insertContent(html);
         if (editor.undoManager && editor.undoManager.add) editor.undoManager.add();
+        return true;
+    }
+
+    // 子比前台编辑器已经创建好的旧媒体窗口，无法接收后来替换脚本的回传事件。
+    // 此时直接写入编辑器并关闭旧窗口，图片和附件都无需刷新“我的图片/我的文件”。
+    function insertIntoZibEditor(element, items) {
+        var $modal = $(element).closest('.modal');
+        if (!$modal.length || !$modal.find('.mini-media-my-box').length) return false;
+        if (!insertItemsIntoActiveEditor(items)) return false;
         $modal.find('.close,[data-dismiss="modal"]').first().trigger('click');
         return true;
     }
@@ -388,7 +394,7 @@
             // 会被误当作主题上传入口拦截，造成标签无法切换、文件无法选择。
             if (event.target.closest && event.target.closest('#yxf-media-frame')) return;
             if (event.target.closest && event.target.closest('.preview-remove,[data-yxf-gallery-bypass="1"]')) return;
-            var raw = event.target.closest && event.target.closest('input[type="file"][zibupload="image_upload"],input[type="file"][accept*="image"],.z_upload_image_button,.ashu_upload_button,.csf--button[data-library],.upload-btn,.preview .add,.preview.upload-preview,.form-upload .preview,.mini-upload .preview,.quick-upload .add,.quick-upload .preview');
+            var raw = event.target.closest && event.target.closest('input[type="file"][zibupload="image_upload"],input[type="file"][accept*="image"],.z_upload_image_button,.ashu_upload_button,.csf--button[data-library],.upload-btn,.preview .add,.preview.upload-preview,.form-upload .preview,.mini-upload .preview,.quick-upload .add,.quick-upload .preview,[aria-label="图片"],[aria-label*="附件"],[aria-label*="文件"]');
             // 插件、主题、导入等 WordPress 系统安装页也会有 file input。
             // 它们不是媒体上传入口，绝不能被图库接管。
             var $rawCandidate = raw ? $(raw) : $();
@@ -409,8 +415,11 @@
             event.stopImmediatePropagation();
             var target = galleryButtonTarget(raw);
             var isForumQuickUpload = $(raw).closest('.quick-upload').length > 0;
-            openGallery({ type: isForumQuickUpload ? 'image' : typeFromElement(target), multiple: isForumQuickUpload ? 9 : selectionLimit(target) }, function (items) {
+            var isEditorMediaButton = $(raw).is('[aria-label="图片"],[aria-label*="附件"],[aria-label*="文件"]');
+            var editorMediaType = String($(raw).attr('aria-label') || '').indexOf('图片') !== -1 ? 'image' : 'all';
+            openGallery({ type: isForumQuickUpload ? 'image' : (isEditorMediaButton ? editorMediaType : typeFromElement(target)), multiple: isForumQuickUpload ? 9 : (isEditorMediaButton ? 99 : selectionLimit(target)) }, function (items) {
                 if (applyForumQuickUpload(raw, items)) return;
+                if (isEditorMediaButton && insertItemsIntoActiveEditor(items)) return;
                 if (insertIntoZibEditor(raw, items)) return;
                 applyThemeSelection(raw, items);
                 if (target !== raw) applyThemeSelection(target, items);
