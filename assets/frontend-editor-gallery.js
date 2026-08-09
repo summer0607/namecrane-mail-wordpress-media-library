@@ -6,6 +6,7 @@
     var callbacks = (window.YXFGalleryMediaCallbacks = window.YXFGalleryMediaCallbacks || {});
     var activeThemeModal = null;
     var activeMediaType = 'all';
+    var activeImageTarget = null;
 
     function galleryUrl(callbackKey, type, multiple) {
         return config.iframeUrl + '?' + $.param({
@@ -23,10 +24,39 @@
     }
     window.YXFGalleryClose = closeGalleryOverlay;
 
+    function currentEditorImage() {
+        var iframe = document.getElementById('post_content_ifr');
+        var editor = (window.tinymce && window.tinymce.activeEditor) || (iframe && iframe.contentWindow && iframe.contentWindow.tinymce && iframe.contentWindow.tinymce.activeEditor);
+        var node = editor && editor.selection && editor.selection.getNode && editor.selection.getNode();
+        return node && String(node.nodeName).toLowerCase() === 'img' ? { editor: editor, node: node } : null;
+    }
+
+    function replaceCurrentEditorImage(items) {
+        if (!activeImageTarget || !activeImageTarget.node || !activeImageTarget.node.isConnected) return false;
+        var item = items.filter(function (candidate) {
+            return candidate && candidate.url && String(candidate.kind || (candidate.mime || '').split('/')[0]).toLowerCase() === 'image';
+        })[0];
+        if (!item) return false;
+        var node = activeImageTarget.node;
+        node.setAttribute('src', String(item.url));
+        node.setAttribute('data-full-url', String(item.url));
+        node.setAttribute('data-edit-file-id', String(Number(item.attachmentId || item.id || 0)));
+        node.setAttribute('alt', String(item.name || ''));
+        if (activeImageTarget.editor && activeImageTarget.editor.undoManager && activeImageTarget.editor.undoManager.add) activeImageTarget.editor.undoManager.add();
+        if (activeImageTarget.editor && activeImageTarget.editor.fire) {
+            activeImageTarget.editor.fire('input');
+            activeImageTarget.editor.fire('change');
+            activeImageTarget.editor.fire('nodechange');
+        }
+        activeImageTarget = null;
+        return true;
+    }
+
     function openGallery($themeModal, type, multiple, onChoose) {
         var key = 'yxf_gallery_' + Date.now() + '_' + Math.random().toString(36).slice(2);
         activeThemeModal = $themeModal;
         activeMediaType = type || 'all';
+        activeImageTarget = currentEditorImage();
         callbacks[key] = function (items) {
             if (typeof onChoose === 'function') {
                 onChoose(items || []);
@@ -116,6 +146,10 @@
     function insertItemsIntoActiveEditor(items) {
         if (!items.length) return;
         var selected = items.map(itemData).filter(function (item) { return item.url; });
+        if (replaceCurrentEditorImage(items)) {
+            if (activeThemeModal && activeThemeModal.length) activeThemeModal.modal('hide');
+            return;
+        }
         // 前台投稿和发帖均由子比主题自己的媒体窗口负责插入。向原窗口派发它
         // 正常“插入”按钮使用的事件，避免不同编辑器实例之间出现插入错位或丢失。
         if (activeThemeModal && activeThemeModal.length && selected.length) {

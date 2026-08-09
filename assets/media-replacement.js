@@ -65,12 +65,64 @@
         return options && options.multiple ? 99 : 1;
     }
 
-    function selectInWordPressFrame(items, frame) {
+    function editorInstances() {
+        var editors = [];
+        if (window.tinymce && window.tinymce.activeEditor) editors.push(window.tinymce.activeEditor);
+        var iframe = document.getElementById('post_content_ifr');
+        var frameTinyMCE = iframe && iframe.contentWindow && iframe.contentWindow.tinymce;
+        if (frameTinyMCE && frameTinyMCE.activeEditor && editors.indexOf(frameTinyMCE.activeEditor) === -1) {
+            editors.push(frameTinyMCE.activeEditor);
+        }
+        return editors;
+    }
+
+    // 在“编辑图片”状态打开图库时，TinyMCE 会保留当前图片为选区。
+    // 记录真实节点，选中新图片后直接替换其属性，而不是再追加一张图片。
+    function activeEditorImage() {
+        var editors = editorInstances();
+        for (var index = 0; index < editors.length; index++) {
+            var editor = editors[index];
+            var node = editor && editor.selection && editor.selection.getNode && editor.selection.getNode();
+            if (node && String(node.nodeName).toLowerCase() === 'img') {
+                return { editor: editor, node: node };
+            }
+        }
+        return null;
+    }
+
+    function replaceEditorImage(target, items) {
+        if (!target || !target.node || !target.node.isConnected || !items || !items.length) return false;
+        var item = items.filter(function (candidate) {
+            return candidate && candidate.url && String(candidate.kind || (candidate.mime || '').split('/')[0]).toLowerCase() === 'image';
+        })[0];
+        if (!item) return false;
+        var node = target.node;
+        node.setAttribute('src', String(item.url));
+        node.setAttribute('data-full-url', String(item.url));
+        node.setAttribute('data-edit-file-id', String(Number(item.attachmentId || item.id || 0)));
+        node.setAttribute('alt', String(item.name || ''));
+        if (target.editor && target.editor.undoManager && target.editor.undoManager.add) target.editor.undoManager.add();
+        if (target.editor && target.editor.fire) {
+            target.editor.fire('input');
+            target.editor.fire('change');
+            target.editor.fire('nodechange');
+        }
+        node.dispatchEvent(new Event('input', { bubbles: true }));
+        node.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+    }
+
+    function selectInWordPressFrame(items, frame, imageTarget) {
         if (!frame || !items.length || !window.wp || !window.wp.media) return;
-        var models = items.filter(function (item) { return item.attachmentId; }).map(function (item) {
-            var attachment = window.wp.media.attachment(item.attachmentId);
+        if (replaceEditorImage(imageTarget, items)) {
+            if (frame.close) frame.close();
+            return;
+        }
+        var models = items.filter(function (item) { return Number(item.attachmentId || item.id || 0) > 0; }).map(function (item) {
+            var attachmentId = Number(item.attachmentId || item.id || 0);
+            var attachment = window.wp.media.attachment(attachmentId);
             attachment.set({
-                id: item.attachmentId,
+                id: attachmentId,
                 url: item.url,
                 type: item.kind || (item.mime || '').split('/')[0],
                 subtype: item.mime,
@@ -91,12 +143,13 @@
         frame.__yxfGalleryOriginalOpen = frame.open;
         frame.open = function () {
             var that = this;
+            var imageTarget = activeEditorImage();
             if (window.wp && window.wp.media) window.wp.media.frame = that;
             openGallery({
                 type: mediaTypeFromOptions(options),
                 multiple: selectionMultiple(that, options)
             }, function (items) {
-                selectInWordPressFrame(items, that);
+                selectInWordPressFrame(items, that, imageTarget);
             });
             return that;
         };
@@ -193,6 +246,51 @@
         return isVisible(dialog) ? dialog : null;
     }
 
+    function urlFieldForFileInput(input, dialog) {
+        if (!input || !dialog || $(dialog).hasClass('mini-media-modal')) return null;
+        var roots = [];
+        var near = input.closest('.form-field, .cmb-row, .csf-field, .rwmb-field, .inside, tr, .field, .control-group');
+        if (near) roots.push(near);
+        roots.push(dialog);
+        var selector = 'input[type="url"], input[type="text"], textarea';
+        var fields = [];
+        roots.some(function (root) {
+            fields = Array.prototype.filter.call(root.querySelectorAll(selector), function (field) {
+                if (field === input || field.disabled || field.readOnly || !isVisible(field)) return false;
+                var hint = [field.name, field.id, field.className, field.getAttribute('data-target'), field.getAttribute('data-field')].join(' ').toLowerCase();
+                return hint.indexOf('search') === -1 && /url|link|file|src|image|media|attachment|cover/.test(hint);
+            });
+            return fields.length > 0;
+        });
+        return fields[0] || null;
+    }
+
+    function writeSelectedUrl(field, item) {
+        if (!field || !item || !item.url) return false;
+        field.value = String(item.url);
+        field.dispatchEvent(new Event('input', { bubbles: true }));
+        field.dispatchEvent(new Event('change', { bubbles: true }));
+        $(field).trigger('input').trigger('change').trigger('blur');
+        return true;
+    }
+
+    function themeItemData(item) {
+        var mime = item.mime || 'application/octet-stream';
+        var kind = item.kind || mime.split('/')[0];
+        return {
+            id: Number(item.attachmentId || item.id || 0),
+            url: String(item.url || ''),
+            large_url: String(item.url || ''),
+            thumbnail_url: kind === 'image' ? String(item.url || '') : '',
+            filename: item.name || '媒体文件',
+            name: item.name || '媒体文件',
+            title: item.name || '媒体文件',
+            mime: mime,
+            type: kind === 'application' ? 'file' : kind,
+            filesizeInBytes: 0
+        };
+    }
+
     function insertIntoActiveEditor(items) {
         if (!items || !items.length) return;
         var editor = window.tinymce && window.tinymce.activeEditor;
@@ -215,9 +313,27 @@
 
         event.preventDefault();
         event.stopImmediatePropagation();
+        var targetField = urlFieldForFileInput(input, dialog);
+        var imageTarget = activeEditorImage();
         openGallery({ type: mediaTypeFromFileInput(input), multiple: input.multiple ? 99 : 1 }, function (items) {
             var detail = { items: items || [], input: input };
             dialog.dispatchEvent(new CustomEvent('yxf-gallery-selected', { bubbles: true, detail: detail }));
+            // 后台常见的“地址输入框 + 上传按钮”优先回填原地址框；只有没有地址框
+            // 时才作为正文插入，避免把一张文件同时插入正文和设置字段。
+            if (writeSelectedUrl(targetField, detail.items[0])) return;
+            if (replaceEditorImage(imageTarget, detail.items)) return;
+            // 子比等前端编辑器的原窗口已绑定 lists_submit；触发同一事件可以保留
+            // 原来的光标、附件格式和编辑器实例，而不是猜测应写入哪个编辑器。
+            if ($(dialog).hasClass('mini-media-modal')) {
+                var selected = detail.items.map(themeItemData).filter(function (item) { return item.url; });
+                if (selected.length) {
+                    $(dialog).trigger('select_submit').trigger('lists_submit', {
+                        data: selected,
+                        ids: selected.map(function (item) { return item.id; })
+                    }).modal('hide');
+                    return;
+                }
+            }
             insertIntoActiveEditor(detail.items);
         });
     }, true);
