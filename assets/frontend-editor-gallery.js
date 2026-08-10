@@ -71,8 +71,9 @@
             window.setTimeout(function () { delete callbacks[key]; }, 0);
         };
         closeGalleryOverlay();
-        var $overlay = $('<div id="yxf-gallery-overlay" role="dialog" aria-modal="true"><div class="yxf-gallery-overlay-panel"><button type="button" class="yxf-gallery-overlay-close" aria-label="关闭">×</button><iframe title="游先锋图库"></iframe></div></div>');
+        var $overlay = $('<div id="yxf-gallery-overlay" role="dialog" aria-modal="true"><div class="yxf-gallery-overlay-panel"><div class="yxf-gallery-overlay-loading">正在打开 NameCrane媒体库…</div><button type="button" class="yxf-gallery-overlay-close" aria-label="关闭">×</button><iframe title="NameCrane媒体库"></iframe></div></div>');
         $overlay.find('iframe').attr('src', galleryUrl(key, activeMediaType, multiple || 1));
+        $overlay.find('iframe').on('load', function () { $overlay.addClass('is-ready'); });
         $overlay.on('click', '.yxf-gallery-overlay-close', function () { closeGalleryOverlay(); delete callbacks[key]; });
         $('body').append($overlay);
     }
@@ -208,6 +209,6 @@
         body.dispatchEvent(new Event('change', {bubbles: true}));
     }
 
-    $('<style id="yxf-gallery-overlay-style">#yxf-gallery-overlay{position:fixed;z-index:999999;inset:0;background:rgba(0,0,0,.48);display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}#yxf-gallery-overlay .yxf-gallery-overlay-panel{position:relative;width:min(800px,calc(100vw - 48px));height:min(580px,calc(100vh - 72px));background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 16px 42px rgba(0,0,0,.38)}#yxf-gallery-overlay iframe{display:block;width:100%;height:100%;border:0}.yxf-gallery-overlay-close{position:absolute;z-index:1;right:10px;top:8px;display:grid;place-items:center;margin:0;padding:0;border:0;background:rgba(0,0,0,.45);color:#fff;width:32px;height:32px;border-radius:50%;font-family:Arial,sans-serif;font-size:25px;font-weight:300;line-height:1;cursor:pointer}@media(max-width:782px){#yxf-gallery-overlay{padding:0}#yxf-gallery-overlay .yxf-gallery-overlay-panel{width:100%;height:100%;border-radius:0}}</style>').appendTo('head');
+    $('<style id="yxf-gallery-overlay-style">#yxf-gallery-overlay{position:fixed;z-index:999999;inset:0;background:rgba(0,0,0,.48);display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}#yxf-gallery-overlay .yxf-gallery-overlay-panel{position:relative;width:min(800px,calc(100vw - 48px));height:min(580px,calc(100vh - 72px));background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 16px 42px rgba(0,0,0,.38)}#yxf-gallery-overlay .yxf-gallery-overlay-loading{position:absolute;inset:0;z-index:0;display:grid;place-items:center;background:#fff;color:#64748b;font-size:14px;transition:opacity .18s ease}#yxf-gallery-overlay iframe{position:relative;z-index:1;display:block;width:100%;height:100%;border:0;opacity:0;transition:opacity .18s ease}#yxf-gallery-overlay.is-ready iframe{opacity:1}#yxf-gallery-overlay.is-ready .yxf-gallery-overlay-loading{opacity:0;pointer-events:none}.yxf-gallery-overlay-close{position:absolute;z-index:2;right:10px;top:8px;display:grid;place-items:center;margin:0;padding:0;border:0;background:rgba(0,0,0,.45);color:#fff;width:32px;height:32px;border-radius:50%;font-family:Arial,sans-serif;font-size:25px;font-weight:300;line-height:1;cursor:pointer}@media(max-width:782px){#yxf-gallery-overlay{padding:0}#yxf-gallery-overlay .yxf-gallery-overlay-panel{width:100%;height:100%;border-radius:0}}</style>').appendTo('head');
 
 }(jQuery, window));

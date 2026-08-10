@@ -2,7 +2,7 @@
 /**
  * Plugin Name: NameCrane邮箱媒体库
  * Description: 将媒体上传至 NameCrane 邮件存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 1.1.8
+ * Version: 1.1.9
  * Update URI: https://youxianfeng.com/
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '1.1.8';
+    const VERSION = '1.1.9';
     const DEFAULT_GALLERY_NAME = 'NameCrane媒体库';
     // 直接使用正式站主域名，避免非 www 域名跳转在部分旧版 cURL 中触发证书用途校验错误。
     const SERVICE_URL = 'https://www.youxianfeng.com/wp-json/namecrane-gallery/v1';
@@ -39,11 +39,13 @@ final class YouXianFeng_Gallery {
         add_action('admin_init', array(__CLASS__, 'maybe_redirect_after_activation'), 0);
         add_action('admin_init', array(__CLASS__, 'enforce_login_gate'), 1);
         add_action('admin_menu', array(__CLASS__, 'admin_menu'));
+        add_action('admin_menu', array(__CLASS__, 'maybe_hide_wordpress_media_menu'), 999);
         add_action('admin_init', array(__CLASS__, 'handle_admin_actions'));
         add_action('wp_ajax_yxf_gallery_upload_image', array(__CLASS__, 'ajax_upload_image'));
         add_action('wp_ajax_yxf_gallery_start_license_checkout', array(__CLASS__, 'ajax_start_license_checkout'));
         add_action('wp_ajax_yxf_gallery_license_order_status', array(__CLASS__, 'ajax_license_order_status'));
         add_action('wp_ajax_yxf_gallery_resolve_pending_item', array(__CLASS__, 'ajax_resolve_pending_item'));
+        add_action('wp_ajax_yxf_gallery_media_items', array(__CLASS__, 'ajax_media_items'));
         add_action('wp_ajax_yxf_gallery_delete_remote_item', array(__CLASS__, 'ajax_delete_remote_item'));
         // 邮箱网盘对刚通过 FTPS/SFTP 写入的文件需要短暂建立索引。
         // 解析公开链接放到异步任务中，不能让浏览器请求一直等待。
@@ -133,6 +135,7 @@ final class YouXianFeng_Gallery {
             'sftp_remote_path'=> '/',
             'api_base'        => 'https://eu1.workspace.org',
             'replace_media_library' => 1,
+            'hide_wordpress_media_menu' => 1,
             'default_mailbox_username' => '',
             'default_mailbox_secret' => '',
             'connection_status' => 'not_connected',
@@ -303,6 +306,7 @@ final class YouXianFeng_Gallery {
         $default_port = $protocol === 'sftp' ? 8222 : 8221;
         $settings = array_merge($current, array(
             'replace_media_library' => empty($_POST['replace_media_library']) ? 0 : 1,
+            'hide_wordpress_media_menu' => empty($_POST['hide_wordpress_media_menu']) ? 0 : 1,
             'source_host'      => $server_host,
             'target_base'      => untrailingslashit($target),
             'storage_protocol' => $protocol,
@@ -615,6 +619,15 @@ final class YouXianFeng_Gallery {
     /** 开关接管图片、视频、音频和普通附件；原始文件始终保存于用户自己的游先锋邮箱网盘。 */
     private static function media_replacement_enabled() {
         return !empty(self::settings()['replace_media_library']) && self::can_use_gallery();
+    }
+
+    /** 可选隐藏后台左侧的 WordPress 原生“媒体”菜单，直接地址与媒体接口保持不变。 */
+    public static function maybe_hide_wordpress_media_menu() {
+        $settings = self::settings();
+        if (empty($settings['replace_media_library']) || empty($settings['hide_wordpress_media_menu'])) {
+            return;
+        }
+        remove_menu_page('upload.php');
     }
 
     public static function enqueue_media_replacement() {
@@ -1488,11 +1501,13 @@ final class YouXianFeng_Gallery {
 
     public static function admin_menu() {
         $brand = self::brand_name();
-        add_menu_page($brand, $brand, self::CAPABILITY, 'yxf-gallery', array(__CLASS__, 'render_gallery_page'), 'dashicons-format-gallery', 58);
-        add_submenu_page('yxf-gallery', $brand, $brand, self::CAPABILITY, 'yxf-gallery', array(__CLASS__, 'render_gallery_page'));
+        // WordPress 原生“媒体”位于菜单位置 10；使用位置 9 固定显示在它上方。
+        add_menu_page($brand, $brand, self::CAPABILITY, 'yxf-gallery', array(__CLASS__, 'render_gallery_page'), 'dashicons-format-gallery', 9);
+        // 主菜单可自定义名称；子菜单首项始终使用清晰的固定名称。
+        add_submenu_page('yxf-gallery', '我的文件', '我的文件', self::CAPABILITY, 'yxf-gallery', array(__CLASS__, 'render_gallery_page'));
         add_submenu_page('yxf-gallery', '上传文件', '上传文件', self::CAPABILITY, 'yxf-gallery-upload', array(__CLASS__, 'render_upload_page'));
         if (self::can_use_independent_login()) {
-            add_submenu_page('yxf-gallery', '登录', '登录', self::CAPABILITY, 'yxf-gallery-login', array(__CLASS__, 'render_login_page'));
+            add_submenu_page('yxf-gallery', '登录邮箱', '登录邮箱', self::CAPABILITY, 'yxf-gallery-login', array(__CLASS__, 'render_login_page'));
         }
         add_submenu_page('yxf-gallery', '图库设置', '设置', 'manage_options', 'yxf-gallery-settings', array(__CLASS__, 'render_settings_page'));
         // 管理文件是管理员专用二级菜单，不出现在作者、编辑的图库菜单中。
@@ -2001,6 +2016,45 @@ final class YouXianFeng_Gallery {
         wp_send_json_success($payload);
     }
 
+    /** 文件列表改为在打开“全部文件”时加载，上传窗口无需等待整份媒体列表。 */
+    public static function ajax_media_items() {
+        if (!self::can_use_gallery()) {
+            wp_send_json_error(array('message' => '无权查看图库文件。'), 403);
+        }
+        check_ajax_referer('yxf_gallery_media_items', 'nonce');
+        wp_send_json_success(array('items' => self::media_frame_items_for_current_user()));
+    }
+
+    /** 仅供“全部文件”按需加载；保留虚拟附件兼容性，但不再阻塞上传弹窗首屏。 */
+    private static function media_frame_items_for_current_user() {
+        global $wpdb;
+        $items = $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM " . self::table_name() . " WHERE status = 'ready' AND author_id = %d ORDER BY id DESC LIMIT 500",
+            get_current_user_id()
+        ));
+        $media_items = array();
+        foreach ($items as $item) {
+            $item_url = self::item_public_url($item);
+            if (!$item_url) {
+                continue;
+            }
+            $attachment_id = self::ensure_virtual_attachment($item);
+            $media_items[] = array(
+                'id'           => (int) $item->id,
+                'attachmentId' => $attachment_id,
+                'name'         => (string) ($item->file_name ?: '媒体文件'),
+                'url'          => esc_url_raw($item_url),
+                'mime'         => (string) $item->mime_type,
+                'kind'         => self::media_kind_from_mime((string) $item->mime_type),
+                'fileSize'     => (int) ($item->file_size ?? 0),
+                'fileSizeLabel'=> self::file_size_label($item->file_size ?? 0),
+                'authorId'     => (int) $item->author_id,
+                'createdAt'    => (string) $item->created_at,
+            );
+        }
+        return $media_items;
+    }
+
     /** 每个请求只删除一张图片，批量操作由浏览器顺序发起，避免超时中断整个后台页面。 */
     public static function ajax_delete_remote_item() {
         if (!self::can_administer()) {
@@ -2488,6 +2542,10 @@ final class YouXianFeng_Gallery {
                         <th scope="row">替换媒体库</th>
                         <td><label><input type="checkbox" name="replace_media_library" value="1" <?php checked(!empty($settings['replace_media_library'])); ?>> 启用 <?php echo esc_html(self::brand_name()); ?> 替换媒体库</label><p class="description">建议勾选，启用后，WordPress的媒体会将图片、视频、音频和普通附件的选择和上传入口改为当前NameCrane邮箱媒体库；该操作不会破坏原媒体库，关闭该项原媒体库恢复正常使用。上传文件默认保存在管理员设置的默认存储文件邮箱中；已独立登录的用户会保存到自己的邮箱空间。</p></td>
                     </tr>
+                    <tr>
+                        <th scope="row">隐藏 WordPress 媒体库菜单</th>
+                        <td><label><input type="checkbox" name="hide_wordpress_media_menu" value="1" <?php checked(!empty($settings['hide_wordpress_media_menu'])); ?>> 隐藏后台左侧的 WordPress 原生“媒体”菜单</label><p class="description">默认勾选。仅隐藏菜单入口，不删除原媒体文件，也不影响主题或插件调用媒体接口。</p></td>
+                    </tr>
                 </table>
                 <hr>
                 <?php
@@ -2795,28 +2853,8 @@ final class YouXianFeng_Gallery {
             <?php
             return;
         }
-        global $wpdb;
-        $items = $wpdb->get_results($wpdb->prepare("SELECT * FROM " . self::table_name() . " WHERE status = 'ready' AND author_id = %d ORDER BY id DESC LIMIT 500", get_current_user_id()));
+        // 上传页首屏不读取媒体列表；切换到“全部文件”后由 AJAX 按需加载。
         $media_items = array();
-        foreach ($items as $item) {
-            $item_url = self::item_public_url($item);
-            if (!$item_url) {
-                continue;
-            }
-            $attachment_id = self::ensure_virtual_attachment($item);
-            $media_items[] = array(
-                'id'        => (int) $item->id,
-                'attachmentId' => $attachment_id,
-                'name'      => (string) ($item->file_name ?: '媒体文件'),
-                'url'       => esc_url_raw($item_url),
-                'mime'      => (string) $item->mime_type,
-                'kind'      => self::media_kind_from_mime((string) $item->mime_type),
-                'fileSize'  => (int) ($item->file_size ?? 0),
-                'fileSizeLabel' => self::file_size_label($item->file_size ?? 0),
-                'authorId'  => (int) $item->author_id,
-                'createdAt' => (string) $item->created_at,
-            );
-        }
         $post_id = absint($_REQUEST['post_id'] ?? 0);
         $callback = sanitize_key(wp_unslash($_REQUEST['yxf_gallery_callback'] ?? ''));
         $multiple = max(1, absint($_REQUEST['yxf_gallery_multiple'] ?? 1));
@@ -2920,8 +2958,13 @@ final class YouXianFeng_Gallery {
             var uploadItems = new Map();
             var uploadedItems = [];
             var uploading = false;
+            var libraryLoaded = false;
+            var libraryLoading = false;
+            var libraryError = '';
             var ajaxUrl = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
             var uploadNonce = <?php echo wp_json_encode(wp_create_nonce('yxf_gallery_upload')); ?>;
+            var libraryNonce = <?php echo wp_json_encode(wp_create_nonce('yxf_gallery_media_items')); ?>;
+            var initialTab = <?php echo wp_json_encode($active_tab); ?>;
             var close = function(){ if (window.parent && window.parent.YXFGalleryClose) window.parent.YXFGalleryClose(); else if (window.parent && window.parent.tb_remove) window.parent.tb_remove(); else if (window.tb_remove) window.tb_remove(); };
             var updateFooter = function(){
                 var hasValue = !!(selectedUrl && selectedUrl.value.trim());
@@ -2951,9 +2994,32 @@ final class YouXianFeng_Gallery {
                 if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(value).then(done); return; }
                 var textarea = document.createElement('textarea'); textarea.value = value; textarea.style.position = 'fixed'; textarea.style.opacity = '0'; document.body.appendChild(textarea); textarea.select(); document.execCommand('copy'); textarea.remove(); done();
             };
+            var refreshTypeOptions = function(){
+                var selected = type.value || 'all';
+                while (type.options.length > 1) type.remove(1);
+                items.forEach(function(item){ if (item.mime && !Array.prototype.some.call(type.options, function(option){ return option.value === item.mime; })) { var option = document.createElement('option'); option.value = item.mime; option.textContent = item.mime.replace(/^.*\//, '').toUpperCase(); type.appendChild(option); } });
+                type.value = Array.prototype.some.call(type.options, function(option){ return option.value === selected; }) ? selected : 'all';
+            };
+            var loadLibrary = function(){
+                if (libraryLoaded || libraryLoading) return;
+                libraryLoading = true;
+                render();
+                var data = new FormData(); data.append('action', 'yxf_gallery_media_items'); data.append('nonce', libraryNonce);
+                fetch(ajaxUrl, {method:'POST', body:data, credentials:'same-origin'})
+                    .then(function(response){ return response.json(); })
+                    .then(function(payload){
+                        if (!payload.success) throw new Error((payload.data && payload.data.message) || '文件列表加载失败。');
+                        items = (payload.data && payload.data.items) || [];
+                        libraryLoaded = true;
+                        refreshTypeOptions();
+                    })
+                    .catch(function(error){ libraryError = (error && error.message) || '文件列表加载失败，请重试。'; libraryLoaded = true; })
+                    .then(function(){ libraryLoading = false; render(); });
+            };
             var switchTab = function(tab){
                 frame.querySelectorAll('[data-yxf-tab]').forEach(function(button){ var selected = button.getAttribute('data-yxf-tab') === tab; button.classList.toggle('is-active', selected); button.setAttribute('aria-selected', selected ? 'true' : 'false'); });
                 frame.querySelectorAll('[data-yxf-panel]').forEach(function(panel){ panel.classList.toggle('is-active', panel.getAttribute('data-yxf-panel') === tab); });
+                if (tab === 'library') loadLibrary();
             };
             var insertItems = function(chosen){
                 chosen = chosen || [];
@@ -3098,6 +3164,8 @@ final class YouXianFeng_Gallery {
             };
             var render = function(){
                 attachments.innerHTML = '';
+                if (!libraryLoaded) { var loading = document.createElement('li'); loading.className = 'yxf-empty'; loading.textContent = libraryLoading ? '正在加载文件…' : '文件列表将在打开“全部文件”时加载。'; attachments.appendChild(loading); return; }
+                if (libraryError) { var failed = document.createElement('li'); failed.className = 'yxf-empty'; failed.textContent = libraryError; attachments.appendChild(failed); return; }
                 var filtered = visibleItems();
                 if (!filtered.length) { var empty = document.createElement('li'); empty.className = 'yxf-empty'; empty.textContent = items.length ? '没有符合条件的媒体文件。' : '图库暂无媒体文件，请先上传文件。'; attachments.appendChild(empty); return; }
                 filtered.forEach(function(item){
@@ -3108,7 +3176,7 @@ final class YouXianFeng_Gallery {
                 });
             };
             Array.prototype.forEach.call(document.querySelectorAll('[data-yxf-tab]'), function(button){ button.addEventListener('click', function(){ switchTab(button.getAttribute('data-yxf-tab')); }); });
-            items.forEach(function(item){ if (item.mime && !Array.prototype.some.call(type.options, function(option){ return option.value === item.mime; })) { var option = document.createElement('option'); option.value = item.mime; option.textContent = item.mime.replace(/^.*\//, '').toUpperCase(); type.appendChild(option); } });
+            refreshTypeOptions();
             type.addEventListener('change', render); search.addEventListener('input', render);
             selectedUrl.addEventListener('input', function(){
                 var value = selectedUrl.value.trim();
@@ -3146,6 +3214,7 @@ final class YouXianFeng_Gallery {
                 }
                 renderUploadQueue();
             }
+            if (initialTab === 'library') switchTab('library');
             render(); updateFooter();
         }());
         </script>

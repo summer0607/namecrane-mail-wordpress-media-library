@@ -62,7 +62,8 @@
             }
         };
         closeGalleryOverlay();
-        var $overlay = $('<div id="yxf-gallery-overlay" role="dialog" aria-modal="true"><div class="yxf-gallery-overlay-panel"><button type="button" class="yxf-gallery-overlay-close" aria-label="关闭">×</button><iframe title="NameCrane媒体库" src="' + galleryUrl(options || {}, key) + '"></iframe></div></div>');
+        var $overlay = $('<div id="yxf-gallery-overlay" role="dialog" aria-modal="true"><div class="yxf-gallery-overlay-panel"><div class="yxf-gallery-overlay-loading">正在打开 NameCrane媒体库…</div><button type="button" class="yxf-gallery-overlay-close" aria-label="关闭">×</button><iframe title="NameCrane媒体库" src="' + galleryUrl(options || {}, key) + '"></iframe></div></div>');
+        $overlay.find('iframe').on('load', function () { $overlay.addClass('is-ready'); });
         $overlay.on('click', '.yxf-gallery-overlay-close', function () {
             delete callbacks[key];
             closeGalleryOverlay();
@@ -122,11 +123,8 @@
         node.setAttribute('data-edit-file-id', String(Number(item.attachmentId || item.id || 0)));
         node.setAttribute('alt', String(item.name || ''));
         if (target.editor && target.editor.undoManager && target.editor.undoManager.add) target.editor.undoManager.add();
-        if (target.editor && target.editor.fire) {
-            target.editor.fire('input');
-            target.editor.fire('change');
-            target.editor.fire('nodechange');
-        }
+        if (target.editor && target.editor.nodeChanged) target.editor.nodeChanged();
+        if (target.editor && target.editor.setDirty) target.editor.setDirty(true);
         node.dispatchEvent(new Event('input', { bubbles: true }));
         node.dispatchEvent(new Event('change', { bubbles: true }));
         return true;
@@ -161,7 +159,27 @@
         $(trigger).siblings('div').first().html((item.kind || '').indexOf('image') === 0 ? '<img src="' + String(item.url).replace(/"/g, '&quot;') + '">' : '<a href="' + String(item.url).replace(/"/g, '&quot;') + '">媒体文件</a>');
     }
 
-    function selectInWordPressFrame(items, frame, imageTarget, trigger) {
+    function frameSelection(frame, options) {
+        var state = frame && frame.state && frame.state();
+        if (!state && frame && frame.setState) {
+            var stateId = (options && options.state) || (frame.options && frame.options.state) || 'library';
+            try {
+                frame.setState(stateId);
+                state = frame.state && frame.state();
+            } catch (error) {
+                state = null;
+            }
+        }
+        if (!state && frame && frame.states && frame.states.first) {
+            state = frame.states.first();
+            if (state && frame.setState) {
+                try { frame.setState(state.id); } catch (error) {}
+            }
+        }
+        return state && state.get && state.get('selection');
+    }
+
+    function selectInWordPressFrame(items, frame, imageTarget, trigger, options) {
         if (!frame || !items.length || !window.wp || !window.wp.media) return;
         var targetField = fieldForMediaTrigger(trigger);
         // 后台表单已明确有来源按钮时，禁止借用当前文章编辑器的选区。
@@ -182,14 +200,21 @@
             }, { silent: true });
             return attachment;
         });
-        var state = frame.state && frame.state();
-        var selection = state && state.get && state.get('selection');
+        // 原生 wp.media 在 open() 时才会激活 state。图库接管了 open()，因此返回
+        // 文件前要主动激活原 frame 的 state，原调用方的 select 回调才能读取 selection。
+        var selection = frameSelection(frame, options);
         if (selection && selection.reset) selection.reset(models);
-        if (frame.trigger) frame.trigger('select');
+        var selectError = null;
+        if (frame.trigger) {
+            try { frame.trigger('select'); } catch (error) { selectError = error; }
+        }
         // 部分旧版主题的回调只读取本地附件，无法识别邮件媒体。原回调执行后
         // 再对同一触发按钮的字段做一次兜底回填，确保不会写入正文。
         if (targetField && writeSelectedUrl(targetField, items[0])) {
             updateTriggerPreview(trigger, items[0]);
+        }
+        if (selectError && !targetField && window.console && window.console.error) {
+            window.console.error(selectError);
         }
     }
 
@@ -206,7 +231,7 @@
                 type: mediaTypeFromOptions(options),
                 multiple: selectionMultiple(that, options)
             }, function (items) {
-                selectInWordPressFrame(items, that, imageTarget, trigger);
+                selectInWordPressFrame(items, that, imageTarget, trigger, options);
             });
             return that;
         };
@@ -261,12 +286,16 @@
             options = options || {};
             openGallery({ type: mediaTypeFromOptions(options), multiple: options.multiple ? 99 : 1 }, function (items) {
                 if (!items.length) return;
-                if (typeof window.send_to_editor === 'function') {
-                    window.send_to_editor(editorHtml(items));
+                var html = editorHtml(items);
+                var editor = window.tinymce && window.tinymce.get && window.tinymce.get(editorId || window.wpActiveEditor);
+                if (!editor && window.tinymce) editor = window.tinymce.activeEditor;
+                if (editor && editor.insertContent) {
+                    if (editor.focus) editor.focus();
+                    editor.insertContent(html);
+                    if (editor.fire) editor.fire('change');
                     return;
                 }
-                var editor = window.tinymce && window.tinymce.get && window.tinymce.get(editorId || window.wpActiveEditor);
-                if (editor && editor.insertContent) editor.insertContent(editorHtml(items));
+                if (typeof window.send_to_editor === 'function') window.send_to_editor(html);
             });
             return false;
         }
@@ -400,7 +429,7 @@
         });
     }, true);
 
-    $('<style id="yxf-gallery-overlay-style">#yxf-gallery-overlay{position:fixed;z-index:999999;inset:0;background:rgba(0,0,0,.48);display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}#yxf-gallery-overlay .yxf-gallery-overlay-panel{position:relative;width:min(960px,100%);height:min(700px,100%);background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 12px 36px rgba(0,0,0,.32)}#yxf-gallery-overlay iframe{display:block;width:100%;height:100%;border:0}.yxf-gallery-overlay-close{position:absolute;z-index:1;right:10px;top:8px;display:grid;place-items:center;margin:0;padding:0;border:0;background:rgba(0,0,0,.45);color:#fff;width:32px;height:32px;border-radius:50%;font-family:Arial,sans-serif;font-size:25px;font-weight:300;line-height:1;cursor:pointer}@media(max-width:782px){#yxf-gallery-overlay{padding:0}#yxf-gallery-overlay .yxf-gallery-overlay-panel{width:100%;height:100%;border-radius:0}}</style>').appendTo('head');
+    $('<style id="yxf-gallery-overlay-style">#yxf-gallery-overlay{position:fixed;z-index:999999;inset:0;background:rgba(0,0,0,.48);display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}#yxf-gallery-overlay .yxf-gallery-overlay-panel{position:relative;width:min(960px,100%);height:min(700px,100%);background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 12px 36px rgba(0,0,0,.32)}#yxf-gallery-overlay .yxf-gallery-overlay-loading{position:absolute;inset:0;z-index:0;display:grid;place-items:center;background:#fff;color:#64748b;font-size:14px;transition:opacity .18s ease}#yxf-gallery-overlay iframe{position:relative;z-index:1;display:block;width:100%;height:100%;border:0;opacity:0;transition:opacity .18s ease}#yxf-gallery-overlay.is-ready iframe{opacity:1}#yxf-gallery-overlay.is-ready .yxf-gallery-overlay-loading{opacity:0;pointer-events:none}.yxf-gallery-overlay-close{position:absolute;z-index:2;right:10px;top:8px;display:grid;place-items:center;margin:0;padding:0;border:0;background:rgba(0,0,0,.45);color:#fff;width:32px;height:32px;border-radius:50%;font-family:Arial,sans-serif;font-size:25px;font-weight:300;line-height:1;cursor:pointer}@media(max-width:782px){#yxf-gallery-overlay{padding:0}#yxf-gallery-overlay .yxf-gallery-overlay-panel{width:100%;height:100%;border-radius:0}}</style>').appendTo('head');
 
     patchWordPressMedia();
     patchWordPressEditorOpen();
