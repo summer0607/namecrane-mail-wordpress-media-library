@@ -5,6 +5,26 @@
 
     var config = window.YXFGalleryReplacement;
     var callbacks = (window.YXFGalleryMediaCallbacks = window.YXFGalleryMediaCallbacks || {});
+    var lastMediaTrigger = null;
+
+    function rememberMediaTrigger(event) {
+        if (!event.target || !event.target.closest) return;
+        var trigger = event.target.closest('.ashu_upload_button, .z_upload_image_button, .csf--button[data-library], .csf-field .button, .cmb-row .button, .rwmb-field .button, [data-yxf-gallery-target]');
+        if (!trigger) return;
+        var explicit = trigger.matches('.ashu_upload_button, .z_upload_image_button, .csf--button[data-library], [data-yxf-gallery-target]');
+        var hint = [trigger.className, trigger.name, trigger.id, trigger.title, trigger.getAttribute('aria-label'), trigger.textContent].join(' ').toLowerCase();
+        if (explicit || /upload|select|choose|image|media|file|cover|上传|选择|图片|媒体|文件|封面/.test(hint)) {
+            lastMediaTrigger = { element: trigger, timestamp: Date.now() };
+        }
+    }
+    // wp.media() 通常在按钮点击处理中同步创建。先记住按钮，选择完成后才能
+    // 将外链写回同一项设置，而不是依赖页面上当前激活的文章编辑器。
+    document.addEventListener('click', rememberMediaTrigger, true);
+
+    function recentMediaTrigger() {
+        if (!lastMediaTrigger || !lastMediaTrigger.element || !lastMediaTrigger.element.isConnected) return null;
+        return Date.now() - lastMediaTrigger.timestamp < 3000 ? lastMediaTrigger.element : null;
+    }
 
     function galleryUrl(options, callbackKey) {
         return config.iframeUrl + '?' + $.param({
@@ -112,9 +132,40 @@
         return true;
     }
 
-    function selectInWordPressFrame(items, frame, imageTarget) {
+    function fieldForMediaTrigger(trigger) {
+        if (!trigger) return null;
+        var $trigger = $(trigger);
+        if ($trigger.hasClass('ashu_upload_button')) {
+            var ashuField = $trigger.siblings('label').find('input[type="url"], input[type="text"], textarea').first()[0];
+            if (ashuField) return ashuField;
+        }
+        if ($trigger.hasClass('z_upload_image_button')) {
+            var zibField = $trigger.siblings('input[type="url"], input[type="text"], textarea').first()[0] || $trigger.parent().find('input[type="url"], input[type="text"], textarea').first()[0];
+            if (zibField) return zibField;
+        }
+        var root = trigger.closest('.form-field, .cmb-row, .csf-field, .rwmb-field, .inside, tr, .field, .control-group, .widget_ui_slider_g');
+        if (!root) return null;
+        var fields = Array.prototype.filter.call(root.querySelectorAll('input[type="url"], input[type="text"], textarea'), function (field) {
+            if (field.disabled || field.readOnly || !isVisible(field)) return false;
+            var hint = [field.name, field.id, field.className, field.getAttribute('data-target'), field.getAttribute('data-field')].join(' ').toLowerCase();
+            return hint.indexOf('search') === -1;
+        });
+        var named = fields.filter(function (field) {
+            return /url|link|file|src|image|media|attachment|cover/.test([field.name, field.id, field.className, field.getAttribute('data-target'), field.getAttribute('data-field')].join(' ').toLowerCase());
+        });
+        return named[0] || (fields.length === 1 ? fields[0] : null);
+    }
+
+    function updateTriggerPreview(trigger, item) {
+        if (!trigger || !item || !item.url || !$(trigger).hasClass('ashu_upload_button')) return;
+        $(trigger).siblings('div').first().html((item.kind || '').indexOf('image') === 0 ? '<img src="' + String(item.url).replace(/"/g, '&quot;') + '">' : '<a href="' + String(item.url).replace(/"/g, '&quot;') + '">媒体文件</a>');
+    }
+
+    function selectInWordPressFrame(items, frame, imageTarget, trigger) {
         if (!frame || !items.length || !window.wp || !window.wp.media) return;
-        if (replaceEditorImage(imageTarget, items)) {
+        var targetField = fieldForMediaTrigger(trigger);
+        // 后台表单已明确有来源按钮时，禁止借用当前文章编辑器的选区。
+        if (!targetField && replaceEditorImage(imageTarget, items)) {
             if (frame.close) frame.close();
             return;
         }
@@ -135,6 +186,11 @@
         var selection = state && state.get && state.get('selection');
         if (selection && selection.reset) selection.reset(models);
         if (frame.trigger) frame.trigger('select');
+        // 部分旧版主题的回调只读取本地附件，无法识别邮件媒体。原回调执行后
+        // 再对同一触发按钮的字段做一次兜底回填，确保不会写入正文。
+        if (targetField && writeSelectedUrl(targetField, items[0])) {
+            updateTriggerPreview(trigger, items[0]);
+        }
     }
 
     function wrapFrame(frame, options) {
@@ -144,12 +200,13 @@
         frame.open = function () {
             var that = this;
             var imageTarget = activeEditorImage();
+            var trigger = recentMediaTrigger();
             if (window.wp && window.wp.media) window.wp.media.frame = that;
             openGallery({
                 type: mediaTypeFromOptions(options),
                 multiple: selectionMultiple(that, options)
             }, function (items) {
-                selectInWordPressFrame(items, that, imageTarget);
+                selectInWordPressFrame(items, that, imageTarget, trigger);
             });
             return that;
         };
