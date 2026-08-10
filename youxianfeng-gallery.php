@@ -2,7 +2,7 @@
 /**
  * Plugin Name: NameCrane邮箱媒体库
  * Description: 将媒体上传至 NameCrane 邮件存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 1.1.6
+ * Version: 1.1.7
  * Update URI: https://youxianfeng.com/
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '1.1.6';
+    const VERSION = '1.1.7';
     const DEFAULT_GALLERY_NAME = 'NameCrane媒体库';
     // 直接使用正式站主域名，避免非 www 域名跳转在部分旧版 cURL 中触发证书用途校验错误。
     const SERVICE_URL = 'https://www.youxianfeng.com/wp-json/namecrane-gallery/v1';

@@ -242,7 +242,12 @@
     }
 
     function nearestMediaDialog(input) {
-        var dialog = input && input.closest && input.closest('[role="dialog"], .media-modal, .modal, .mce-window');
+        if (!input || !input.closest) return null;
+        // 子比媒体窗口内还有一个带 role=dialog 的内层容器。优先返回最外层
+        // mini-media-modal，才能触发这个窗口原本绑定的回填处理，而不是误插入正文。
+        var miniMedia = input.closest('.mini-media-modal');
+        if (isVisible(miniMedia)) return miniMedia;
+        var dialog = input.closest('[role="dialog"], .media-modal, .modal, .mce-window');
         return isVisible(dialog) ? dialog : null;
     }
 
@@ -321,7 +326,6 @@
             // 后台常见的“地址输入框 + 上传按钮”优先回填原地址框；只有没有地址框
             // 时才作为正文插入，避免把一张文件同时插入正文和设置字段。
             if (writeSelectedUrl(targetField, detail.items[0])) return;
-            if (replaceEditorImage(imageTarget, detail.items)) return;
             // 子比等前端编辑器的原窗口已绑定 lists_submit；触发同一事件可以保留
             // 原来的光标、附件格式和编辑器实例，而不是猜测应写入哪个编辑器。
             if ($(dialog).hasClass('mini-media-modal')) {
@@ -334,6 +338,7 @@
                     return;
                 }
             }
+            if (replaceEditorImage(imageTarget, detail.items)) return;
             insertIntoActiveEditor(detail.items);
         });
     }, true);
