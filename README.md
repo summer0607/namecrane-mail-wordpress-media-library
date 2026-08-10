@@ -1,4 +1,4 @@
-# NameCrane Mail WordPress 媒体库
+# NameCrane Mail To WordPress媒体库
 
 因NameCrane Mail邮箱有终身有效的云存储空间，邮箱服务完全用不到这么多空间，而本人的WordPress网站服务器存储空间已捉襟见肘，所以开发该插件主要用于将 **NameCrane Mail 邮箱与网盘空间**取代 WordPress 媒体库。上传的图片、视频、音频、文档和压缩包会自动保存到 NameCrane 文件空间中，并自动生成公开链接，停用插件完全不会影响WordPress本身的媒体库功能。
 
