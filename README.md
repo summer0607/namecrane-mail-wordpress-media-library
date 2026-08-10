@@ -15,6 +15,15 @@
 - 可按文件类型限制上传数量、大小和格式。
 - 可自定义媒体库名称。
 
+## 支持的文件格式
+
+文件的格式支持取决于NameCrane Mail邮箱允许上传到邮件的格式，具体如下：
+- 图片：JPG、JPEG、PNG、WEBP、GIF、AVIF、BMP、HEIC、ICO、SVG
+- 视频：MP4、M4V、MOV、WEBM、AVI、MKV
+- 音频：MP3、M4A、AAC、WAV、OGG、OPUS、FLAC
+- 文档：PDF、DOC、DOCX、XLS、XLSX、PPT、PPTX、TXT、CSV、MD、RTF
+- 压缩包：ZIP、RAR、7Z、TAR、GZ
+
 ## 界面预览
 
 | 上传文件 | 管理文件 |
