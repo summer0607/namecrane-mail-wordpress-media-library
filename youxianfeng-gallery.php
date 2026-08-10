@@ -2,7 +2,7 @@
 /**
  * Plugin Name: NameCrane邮箱媒体库
  * Description: 将媒体上传至 NameCrane 邮件存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 1.1.9
+ * Version: 1.1.10
  * Update URI: https://youxianfeng.com/
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '1.1.9';
+    const VERSION = '1.1.10';
     const DEFAULT_GALLERY_NAME = 'NameCrane媒体库';
     // 直接使用正式站主域名，避免非 www 域名跳转在部分旧版 cURL 中触发证书用途校验错误。
     const SERVICE_URL = 'https://www.youxianfeng.com/wp-json/namecrane-gallery/v1';
@@ -2016,29 +2016,71 @@ final class YouXianFeng_Gallery {
         wp_send_json_success($payload);
     }
 
-    /** 文件列表改为在打开“全部文件”时加载，上传窗口无需等待整份媒体列表。 */
+    /** 文件列表改为在打开“全部文件”时分页加载，上传窗口无需等待整份媒体列表。 */
     public static function ajax_media_items() {
         if (!self::can_use_gallery()) {
             wp_send_json_error(array('message' => '无权查看图库文件。'), 403);
         }
         check_ajax_referer('yxf_gallery_media_items', 'nonce');
-        wp_send_json_success(array('items' => self::media_frame_items_for_current_user()));
+        $page = max(1, absint($_POST['page'] ?? 1));
+        $per_page = min(60, max(12, absint($_POST['per_page'] ?? 30)));
+        $filters = array(
+            'search' => sanitize_text_field(wp_unslash($_POST['search'] ?? '')),
+            'mime'   => sanitize_text_field(wp_unslash($_POST['mime'] ?? '')),
+            'kind'   => sanitize_key(wp_unslash($_POST['kind'] ?? 'all')),
+        );
+        wp_send_json_success(self::media_frame_items_for_current_user($page, $per_page, $filters));
     }
 
-    /** 仅供“全部文件”按需加载；保留虚拟附件兼容性，但不再阻塞上传弹窗首屏。 */
-    private static function media_frame_items_for_current_user() {
+    /**
+     * 仅供“全部文件”按需分页加载；保留虚拟附件兼容性，但不再阻塞上传弹窗首屏。
+     * 每次只处理当前页，避免文件较多时一次性创建虚拟附件造成窗口卡顿。
+     */
+    private static function media_frame_items_for_current_user($page = 1, $per_page = 30, $filters = array()) {
         global $wpdb;
-        $items = $wpdb->get_results($wpdb->prepare(
-            "SELECT * FROM " . self::table_name() . " WHERE status = 'ready' AND author_id = %d ORDER BY id DESC LIMIT 500",
-            get_current_user_id()
-        ));
+        $page = max(1, (int) $page);
+        $per_page = min(60, max(12, (int) $per_page));
+        $where = array("status = 'ready'", 'author_id = %d');
+        $params = array(get_current_user_id());
+        $search = trim((string) ($filters['search'] ?? ''));
+        $mime = trim((string) ($filters['mime'] ?? ''));
+        $kind = sanitize_key((string) ($filters['kind'] ?? 'all'));
+
+        if ($search !== '') {
+            $where[] = 'file_name LIKE %s';
+            $params[] = '%' . $wpdb->esc_like($search) . '%';
+        }
+        if ($mime !== '') {
+            $where[] = 'mime_type = %s';
+            $params[] = $mime;
+        }
+        if ($kind === 'image' || $kind === 'video' || $kind === 'audio') {
+            $where[] = 'mime_type LIKE %s';
+            $params[] = $kind . '/%';
+        } elseif ($kind === 'file') {
+            $where[] = "mime_type NOT LIKE 'image/%' AND mime_type NOT LIKE 'video/%' AND mime_type NOT LIKE 'audio/%'";
+        }
+        $where_sql = implode(' AND ', $where);
+        $table = self::table_name();
+        $count_sql = "SELECT COUNT(*) FROM {$table} WHERE {$where_sql}";
+        $total = (int) $wpdb->get_var($wpdb->prepare($count_sql, $params));
+        $total_pages = max(1, (int) ceil($total / $per_page));
+        $page = min($page, $total_pages);
+        $query_params = array_merge($params, array($per_page, ($page - 1) * $per_page));
+        $items_sql = "SELECT * FROM {$table} WHERE {$where_sql} ORDER BY id DESC LIMIT %d OFFSET %d";
+        $items = $wpdb->get_results($wpdb->prepare($items_sql, $query_params));
+        $mime_sql = "SELECT DISTINCT mime_type FROM {$table} WHERE status = 'ready' AND author_id = %d AND mime_type <> '' ORDER BY mime_type ASC";
+        $mime_types = $wpdb->get_col($wpdb->prepare($mime_sql, get_current_user_id()));
         $media_items = array();
         foreach ($items as $item) {
             $item_url = self::item_public_url($item);
             if (!$item_url) {
                 continue;
             }
-            $attachment_id = self::ensure_virtual_attachment($item);
+            $attachment_id = (int) ($item->attachment_id ?? 0);
+            if (!$attachment_id && self::media_replacement_enabled()) {
+                $attachment_id = self::ensure_virtual_attachment($item);
+            }
             $media_items[] = array(
                 'id'           => (int) $item->id,
                 'attachmentId' => $attachment_id,
@@ -2052,7 +2094,14 @@ final class YouXianFeng_Gallery {
                 'createdAt'    => (string) $item->created_at,
             );
         }
-        return $media_items;
+        return array(
+            'items'      => $media_items,
+            'page'       => $page,
+            'perPage'    => $per_page,
+            'total'      => $total,
+            'totalPages' => $total_pages,
+            'mimeTypes'  => array_values(array_filter(array_map('strval', $mime_types))),
+        );
     }
 
     /** 每个请求只删除一张图片，批量操作由浏览器顺序发起，避免超时中断整个后台页面。 */
@@ -2249,8 +2298,9 @@ final class YouXianFeng_Gallery {
     private static function render_copy_script() {
         ?>
         <style>
-            .yxf-gallery-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;max-width:1080px}.yxf-gallery-card{position:relative;min-width:0;width:auto!important;margin:0!important;padding:10px;overflow:visible}.yxf-gallery-thumb-wrap{position:relative;height:110px;overflow:hidden;background:#f0f0f1}.yxf-gallery-thumb,.yxf-gallery-file{display:block;width:100%;height:110px;box-sizing:border-box;object-fit:cover;background:#f0f0f1}.yxf-gallery-file{display:flex;align-items:center;justify-content:center;color:#2271b1;text-align:center;text-decoration:none}.yxf-gallery-thumb-badges{position:absolute;inset:0;pointer-events:none}.yxf-gallery-thumb-badge{position:absolute;bottom:7px;overflow:hidden;padding:3px 7px;border-radius:999px;background:rgba(0,0,0,.45);color:#fff;font-size:8px;line-height:1.35;white-space:nowrap;text-overflow:ellipsis}.yxf-gallery-thumb-badge:first-child{left:7px}.yxf-gallery-thumb-badge:last-child{right:7px;max-width:calc(100% - 14px)}.yxf-gallery-pending{color:#646970}.yxf-gallery-file-name{margin:10px 0 3px;word-break:break-all}.yxf-gallery-card-meta{margin:0;color:#787c82;font-size:12px;line-height:1.45}.yxf-gallery-card-actions{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px}.yxf-gallery-delete-trigger{display:flex;align-items:center;justify-content:center;width:20px;height:20px;padding:0;border:0;background:transparent;cursor:pointer}.yxf-gallery-delete-trigger svg{display:block;width:16px;height:16px;fill:#bfbfbf}.yxf-gallery-delete-trigger:hover svg,.yxf-gallery-delete-trigger:focus svg{fill:#b32d2e}.yxf-gallery-copy-button{position:relative;padding:0;border:0;background:transparent;color:#2271b1;text-decoration:none;cursor:pointer}.yxf-gallery-copy-button:hover,.yxf-gallery-copy-button:focus{color:#135e96;text-decoration:none}.yxf-gallery-copy-button:after{content:attr(data-link);position:absolute;z-index:20;right:0;bottom:calc(100% + 8px);display:none;width:240px;max-width:calc(100vw - 40px);padding:7px 9px;border-radius:3px;background:rgba(0,0,0,.78);color:#fff;font-size:12px;font-weight:400;line-height:1.45;text-align:left;white-space:normal;word-break:break-all;box-shadow:0 2px 8px rgba(0,0,0,.2);pointer-events:none}.yxf-gallery-copy-button:hover:after,.yxf-gallery-copy-button:focus:after{display:block}.yxf-gallery-limit-note{max-width:1080px;margin:18px 0 0;padding:10px 12px;border-left:3px solid #72aee6;background:#f6f7f7;color:#50575e}.yxf-gallery-wrap #yxf-gallery-manage-form .yxf-gallery-limit-note{max-width:1280px}.yxf-gallery-delete-dialog{position:fixed;z-index:99999;inset:0}.yxf-gallery-delete-dialog-mask{position:absolute;inset:0;background:rgba(0,0,0,.32)}.yxf-gallery-delete-dialog-card{position:relative;z-index:1;width:min(360px,calc(100vw - 40px));margin:18vh auto 0;padding:20px;background:#fff;border-radius:4px;box-shadow:0 8px 24px rgba(0,0,0,.22)}.yxf-gallery-delete-dialog-card h2{margin:0 0 10px;font-size:18px}.yxf-gallery-delete-dialog-card p{margin:8px 0}.yxf-gallery-delete-dialog-card form{display:inline-block;margin:8px 8px 0 0}.yxf-gallery-delete-dialog-card .description{line-height:1.6}.yxf-gallery-delete-cancel{display:block;margin-top:12px}@media(max-width:782px){.yxf-gallery-grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}}
+            .yxf-gallery-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;max-width:1080px}.yxf-gallery-card{position:relative;min-width:0;width:auto!important;margin:0!important;padding:10px;overflow:visible}.yxf-gallery-thumb-wrap{position:relative;height:110px;overflow:hidden;background:#f0f0f1}.yxf-gallery-thumb,.yxf-gallery-file{display:block;width:100%;height:110px;box-sizing:border-box;object-fit:cover;background:#f0f0f1}.yxf-gallery-file{display:flex;align-items:center;justify-content:center;color:#2271b1;text-align:center;text-decoration:none}.yxf-gallery-thumb-badges{position:absolute;inset:0;pointer-events:none}.yxf-gallery-thumb-badge{position:absolute;bottom:7px;overflow:hidden;padding:3px 7px;border-radius:999px;background:rgba(0,0,0,.45);color:#fff;font-size:8px;line-height:1.35;white-space:nowrap;text-overflow:ellipsis}.yxf-gallery-thumb-badge:first-child{left:7px}.yxf-gallery-thumb-badge:last-child{right:7px;max-width:calc(100% - 14px)}.yxf-gallery-pending{color:#646970}.yxf-gallery-file-name{margin:10px 0 3px;word-break:break-all}.yxf-gallery-card-meta{margin:0;color:#787c82;font-size:12px;line-height:1.45}.yxf-gallery-card-actions{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px}.yxf-gallery-delete-trigger{display:flex;align-items:center;justify-content:center;width:20px;height:20px;padding:0;border:0;background:transparent;cursor:pointer}.yxf-gallery-delete-trigger svg{display:block;width:16px;height:16px;fill:#bfbfbf}.yxf-gallery-delete-trigger:hover svg,.yxf-gallery-delete-trigger:focus svg{fill:#b32d2e}.yxf-gallery-copy-button{position:relative;padding:0;border:0;background:transparent;color:#2271b1;text-decoration:none;cursor:pointer}.yxf-gallery-copy-button:hover,.yxf-gallery-copy-button:focus{color:#135e96;text-decoration:none}.yxf-gallery-copy-button:after{content:attr(data-link);position:absolute;z-index:20;right:0;bottom:calc(100% + 8px);display:none;width:240px;max-width:calc(100vw - 40px);padding:7px 9px;border-radius:3px;background:rgba(0,0,0,.78);color:#fff;font-size:12px;font-weight:400;line-height:1.45;text-align:left;white-space:normal;word-break:break-all;box-shadow:0 2px 8px rgba(0,0,0,.2);pointer-events:none}.yxf-gallery-copy-button:hover:after,.yxf-gallery-copy-button:focus{color:#135e96;text-decoration:none}.yxf-gallery-limit-note{max-width:1080px;margin:18px 0 0;padding:10px 12px;border-left:3px solid #72aee6;background:#f6f7f7;color:#50575e}.yxf-gallery-wrap #yxf-gallery-manage-form .yxf-gallery-limit-note{max-width:1280px}.yxf-gallery-delete-dialog{position:fixed;z-index:99999;inset:0}.yxf-gallery-delete-dialog-mask{position:absolute;inset:0;background:rgba(0,0,0,.32)}.yxf-gallery-delete-dialog-card{position:relative;z-index:1;width:min(360px,calc(100vw - 40px));margin:18vh auto 0;padding:20px;background:#fff;border-radius:4px;box-shadow:0 8px 24px rgba(0,0,0,.22)}.yxf-gallery-delete-dialog-card h2{margin:0 0 10px;font-size:18px}.yxf-gallery-delete-dialog-card p{margin:8px 0}.yxf-gallery-delete-dialog-card form{display:inline-block;margin:8px 8px 0 0}.yxf-gallery-delete-dialog-card .description{line-height:1.6}.yxf-gallery-delete-cancel{display:block;margin-top:12px}.yxf-gallery-pagination{display:flex;align-items:center;justify-content:flex-end;gap:12px;max-width:1080px;margin:24px 0 12px;color:#7b8495}.yxf-gallery-pagination-info{margin-right:auto;font-size:12px}.yxf-gallery-pagination .tablenav-pages{margin:0}.yxf-gallery-pagination .page-numbers{display:inline-flex;align-items:center;justify-content:center;min-width:30px;height:30px;margin:0 2px;padding:0 7px;border:0;border-radius:8px;background:#f2f5fa;color:#667085;text-decoration:none;font-weight:600}.yxf-gallery-pagination .page-numbers:hover{background:#e8efff;color:#4e6ef2}.yxf-gallery-pagination .page-numbers.current{background:linear-gradient(135deg,#4e6ef2,#65a5ff);color:#fff;box-shadow:0 4px 10px rgba(78,110,242,.25)}@media(max-width:782px){.yxf-gallery-grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}.yxf-gallery-pagination{flex-wrap:wrap;justify-content:center}.yxf-gallery-pagination-info{width:100%;margin:0;text-align:center}}
         </style>
+        <style>.yxf-gallery-copy-button:hover:after,.yxf-gallery-copy-button:focus:after{display:block}</style>
         <script>
         document.addEventListener('click', function(event) {
             var deleteTrigger = event.target.closest('.yxf-gallery-delete-trigger');
@@ -2282,7 +2332,8 @@ final class YouXianFeng_Gallery {
         }
         global $wpdb;
         $item_total = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM " . self::table_name() . " WHERE author_id = %d", get_current_user_id()));
-        $per_page = 100;
+        // “我的文件”按较小页数展示，避免文件数量增长后单页过长且始终看不到分页器。
+        $per_page = 24;
         $current_page = max(1, absint($_GET['paged'] ?? 1));
         $total_pages = max(1, (int) ceil($item_total / $per_page));
         $current_page = min($current_page, $total_pages);
@@ -2326,7 +2377,7 @@ final class YouXianFeng_Gallery {
                         </article>
                     <?php endforeach; ?>
                 </div>
-                <?php if ($total_pages > 1) : ?><div class="tablenav yxf-gallery-pagination"><div class="tablenav-pages"><?php echo paginate_links(array('base' => add_query_arg('paged', '%#%', admin_url('admin.php?page=yxf-gallery')), 'format' => '', 'current' => $current_page, 'total' => $total_pages, 'prev_text' => '‹', 'next_text' => '›')); ?></div></div><?php endif; ?>
+                <?php if ($total_pages > 1) : ?><nav class="yxf-gallery-pagination" aria-label="我的文件分页"><span class="yxf-gallery-pagination-info">共 <?php echo esc_html($item_total); ?> 个文件，第 <?php echo esc_html($current_page); ?>/<?php echo esc_html($total_pages); ?> 页</span><div class="tablenav-pages"><?php echo paginate_links(array('base' => add_query_arg('paged', '%#%', admin_url('admin.php?page=yxf-gallery')), 'format' => '', 'current' => $current_page, 'total' => $total_pages, 'end_size' => 1, 'mid_size' => 1, 'prev_text' => '‹', 'next_text' => '›')); ?></div></nav><?php endif; ?>
             <?php endif; ?>
         </div>
         <?php self::render_copy_script();
@@ -2892,8 +2943,8 @@ final class YouXianFeng_Gallery {
             .yxf-uploaded-thumb{border-radius:10px;background:var(--yxf-surface-soft);border-color:transparent}.yxf-uploaded-thumb:hover,.yxf-uploaded-thumb.is-selected{border-color:var(--yxf-primary);box-shadow:0 0 0 2px color-mix(in srgb,var(--yxf-primary) 15%,transparent)}
             .yxf-library-toolbar{min-height:64px;padding:0 22px;border-color:var(--yxf-line);background:var(--yxf-surface)}.yxf-library-toolbar select,.yxf-library-toolbar input,.yxf-media-footer input{border:1px solid var(--yxf-line);border-radius:8px;background:var(--yxf-surface-soft);color:var(--yxf-text);outline:0}.yxf-library-toolbar select:focus,.yxf-library-toolbar input:focus,.yxf-media-footer input:focus{border-color:var(--yxf-primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--yxf-primary) 14%,transparent)}
             .yxf-attachments{gap:14px;padding:20px;background:var(--yxf-bg)}.yxf-attachment{border:0;border-radius:12px;background:var(--yxf-surface);box-shadow:0 4px 14px rgba(0,0,0,.06);transition:transform .18s ease,box-shadow .18s ease}.yxf-attachment:hover{transform:translateY(-2px);box-shadow:var(--yxf-shadow)}.yxf-attachment.is-selected{border:3px solid var(--yxf-primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--yxf-primary) 14%,transparent)}.yxf-attachment.is-selected:after{background:linear-gradient(135deg,var(--yxf-primary),var(--yxf-primary-end))}
-            .yxf-file-icon{color:var(--yxf-muted)}.yxf-file-icon b{color:var(--yxf-primary)}.yxf-details{border-color:var(--yxf-line);background:var(--yxf-surface);color:var(--yxf-text)}.yxf-details.is-empty,.yxf-detail-meta{color:var(--yxf-muted)}.yxf-details img,.yxf-details video{border-radius:10px;background:var(--yxf-surface-soft)}.yxf-detail-url{color:var(--yxf-primary)}
-            .yxf-media-footer{min-height:76px;flex-basis:76px;padding:18px 22px;border-color:var(--yxf-line);background:var(--yxf-surface);box-shadow:0 -3px 16px rgba(0,0,0,.04)}.yxf-media-footer input{height:42px;max-width:520px;padding:0 13px;font-size:14px}.yxf-media-footer .button{height:42px;min-width:72px;padding:0 18px!important;font-size:14px;font-weight:600;line-height:42px}.yxf-media-footer #yxf-insert{min-width:88px;padding:0 26px!important}.yxf-empty{color:var(--yxf-muted)}
+            .yxf-library-list{display:flex;flex:1;min-width:0;flex-direction:column}.yxf-file-icon{color:var(--yxf-muted)}.yxf-file-icon b{color:var(--yxf-primary)}.yxf-details{border-color:var(--yxf-line);background:var(--yxf-surface);color:var(--yxf-text)}.yxf-details.is-empty,.yxf-detail-meta{color:var(--yxf-muted)}.yxf-details img,.yxf-details video{border-radius:10px;background:var(--yxf-surface-soft)}.yxf-detail-url{color:var(--yxf-primary)}
+            .yxf-media-footer{min-height:76px;flex-basis:76px;padding:18px 22px;border-color:var(--yxf-line);background:var(--yxf-surface);box-shadow:0 -3px 16px rgba(0,0,0,.04)}.yxf-media-footer input{height:42px;max-width:520px;padding:0 13px;font-size:14px}.yxf-media-footer .button{height:42px;min-width:72px;padding:0 18px!important;font-size:14px;font-weight:600;line-height:42px}.yxf-media-footer #yxf-insert{min-width:88px;padding:0 26px!important}.yxf-empty{color:var(--yxf-muted)}.yxf-media-pagination{display:flex;align-items:center;justify-content:flex-end;gap:7px;min-height:54px;padding:9px 20px;box-sizing:border-box;border-top:1px solid var(--yxf-line);background:var(--yxf-surface);color:var(--yxf-muted);font-size:12px}.yxf-media-pagination-info{margin-right:auto}.yxf-media-page{display:inline-flex;align-items:center;justify-content:center;min-width:32px;height:32px;padding:0 7px;border:0;border-radius:8px;background:transparent;color:var(--yxf-muted);font:inherit;font-weight:600;cursor:pointer}.yxf-media-page:hover:not(:disabled){background:var(--yxf-surface-soft);color:var(--yxf-primary)}.yxf-media-page.is-current{background:linear-gradient(135deg,var(--yxf-primary),var(--yxf-primary-end));color:#fff;box-shadow:0 4px 10px color-mix(in srgb,var(--yxf-primary) 25%,transparent)}.yxf-media-page:disabled{opacity:.36;cursor:not-allowed}.yxf-media-page.is-ellipsis{min-width:16px;padding:0;cursor:default}.yxf-media-page.is-ellipsis:hover{background:transparent;color:var(--yxf-muted)}
             @media(max-width:720px){.yxf-media-tabs{height:56px;padding:0 10px}.yxf-media-tab{padding:0 12px}.yxf-upload-panel{padding:16px}.yxf-upload-box{padding:30px 18px;border-radius:12px}.yxf-details{width:220px}.yxf-attachments{gap:10px;padding:12px}}
         </style>
         <div class="yxf-media-frame" id="yxf-media-frame">
@@ -2922,7 +2973,7 @@ final class YouXianFeng_Gallery {
                         <input id="yxf-search" type="search" placeholder="搜索文件名称" aria-label="搜索文件名称">
                     </div>
                     <div class="yxf-library-main">
-                        <ul class="yxf-attachments" id="yxf-attachments" aria-label="全部文件列表"></ul>
+                        <div class="yxf-library-list"><ul class="yxf-attachments" id="yxf-attachments" aria-label="全部文件列表"></ul><nav class="yxf-media-pagination" id="yxf-media-pagination" aria-label="文件分页"></nav></div>
                         <aside class="yxf-details is-empty" id="yxf-details">请选择一个文件查看详情</aside>
                     </div>
                 </section>
@@ -2943,6 +2994,7 @@ final class YouXianFeng_Gallery {
             var selectedItems = [];
             var frame = document.getElementById('yxf-media-frame');
             var attachments = document.getElementById('yxf-attachments');
+            var pagination = document.getElementById('yxf-media-pagination');
             var details = document.getElementById('yxf-details');
             var insert = document.getElementById('yxf-insert');
             var cancel = document.getElementById('yxf-cancel');
@@ -2961,6 +3013,11 @@ final class YouXianFeng_Gallery {
             var libraryLoaded = false;
             var libraryLoading = false;
             var libraryError = '';
+            var libraryPage = 1;
+            var libraryPerPage = 30;
+            var libraryTotal = 0;
+            var libraryTotalPages = 1;
+            var librarySearchTimer = 0;
             var ajaxUrl = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
             var uploadNonce = <?php echo wp_json_encode(wp_create_nonce('yxf_gallery_upload')); ?>;
             var libraryNonce = <?php echo wp_json_encode(wp_create_nonce('yxf_gallery_media_items')); ?>;
@@ -2994,24 +3051,32 @@ final class YouXianFeng_Gallery {
                 if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(value).then(done); return; }
                 var textarea = document.createElement('textarea'); textarea.value = value; textarea.style.position = 'fixed'; textarea.style.opacity = '0'; document.body.appendChild(textarea); textarea.select(); document.execCommand('copy'); textarea.remove(); done();
             };
-            var refreshTypeOptions = function(){
+            var refreshTypeOptions = function(mimeTypes){
                 var selected = type.value || 'all';
                 while (type.options.length > 1) type.remove(1);
-                items.forEach(function(item){ if (item.mime && !Array.prototype.some.call(type.options, function(option){ return option.value === item.mime; })) { var option = document.createElement('option'); option.value = item.mime; option.textContent = item.mime.replace(/^.*\//, '').toUpperCase(); type.appendChild(option); } });
+                (mimeTypes || items.map(function(item){ return item.mime; })).forEach(function(itemMime){ if (itemMime && !Array.prototype.some.call(type.options, function(option){ return option.value === itemMime; })) { var option = document.createElement('option'); option.value = itemMime; option.textContent = itemMime.replace(/^.*\//, '').toUpperCase(); type.appendChild(option); } });
                 type.value = Array.prototype.some.call(type.options, function(option){ return option.value === selected; }) ? selected : 'all';
             };
-            var loadLibrary = function(){
-                if (libraryLoaded || libraryLoading) return;
+            var loadLibrary = function(page){
+                page = Math.max(1, Number(page || 1));
+                if (libraryLoading) return;
                 libraryLoading = true;
+                libraryError = '';
                 render();
-                var data = new FormData(); data.append('action', 'yxf_gallery_media_items'); data.append('nonce', libraryNonce);
+                var selectedMime = type.value === 'all' ? '' : (type.value || '');
+                var data = new FormData(); data.append('action', 'yxf_gallery_media_items'); data.append('nonce', libraryNonce); data.append('page', page); data.append('per_page', libraryPerPage); data.append('search', search.value || ''); data.append('mime', selectedMime); data.append('kind', requestedType || 'all');
                 fetch(ajaxUrl, {method:'POST', body:data, credentials:'same-origin'})
                     .then(function(response){ return response.json(); })
                     .then(function(payload){
                         if (!payload.success) throw new Error((payload.data && payload.data.message) || '文件列表加载失败。');
-                        items = (payload.data && payload.data.items) || [];
+                        var result = payload.data || {};
+                        items = result.items || [];
+                        libraryPage = Number(result.page || page);
+                        libraryPerPage = Number(result.perPage || libraryPerPage);
+                        libraryTotal = Number(result.total || 0);
+                        libraryTotalPages = Math.max(1, Number(result.totalPages || 1));
                         libraryLoaded = true;
-                        refreshTypeOptions();
+                        refreshTypeOptions(result.mimeTypes || []);
                     })
                     .catch(function(error){ libraryError = (error && error.message) || '文件列表加载失败，请重试。'; libraryLoaded = true; })
                     .then(function(){ libraryLoading = false; render(); });
@@ -3019,7 +3084,7 @@ final class YouXianFeng_Gallery {
             var switchTab = function(tab){
                 frame.querySelectorAll('[data-yxf-tab]').forEach(function(button){ var selected = button.getAttribute('data-yxf-tab') === tab; button.classList.toggle('is-active', selected); button.setAttribute('aria-selected', selected ? 'true' : 'false'); });
                 frame.querySelectorAll('[data-yxf-panel]').forEach(function(panel){ panel.classList.toggle('is-active', panel.getAttribute('data-yxf-panel') === tab); });
-                if (tab === 'library') loadLibrary();
+                if (tab === 'library' && !libraryLoaded) loadLibrary(1);
             };
             var insertItems = function(chosen){
                 chosen = chosen || [];
@@ -3162,22 +3227,45 @@ final class YouXianFeng_Gallery {
                 actions.appendChild(copyButton); details.append(preview,title,mime,size,date,link,actions);
                 attachments.querySelectorAll('.yxf-attachment').forEach(function(node){ node.classList.toggle('is-selected', selectedItems.some(function(selected){ return selected.id === Number(node.getAttribute('data-id')); })); });
             };
+            var renderPagination = function(){
+                if (!pagination) return;
+                pagination.innerHTML = '';
+                if (!libraryLoaded || libraryError) return;
+                var info = document.createElement('span'); info.className = 'yxf-media-pagination-info'; info.textContent = libraryTotal ? ('共 ' + libraryTotal + ' 个文件，第 ' + libraryPage + '/' + libraryTotalPages + ' 页') : '暂无文件'; pagination.appendChild(info);
+                if (libraryTotalPages <= 1) return;
+                var addButton = function(label, page, className, disabled){ var button = document.createElement('button'); button.type = 'button'; button.className = 'yxf-media-page' + (className ? ' ' + className : ''); button.textContent = label; button.disabled = !!disabled; if (!disabled && page) button.addEventListener('click', function(){ if (page === libraryPage) return; clearSelection(); loadLibrary(page); }); pagination.appendChild(button); };
+                var addEllipsis = function(){ addButton('…', 0, 'is-ellipsis', true); };
+                addButton('‹', libraryPage - 1, '', libraryPage <= 1);
+                var pages = [1];
+                for (var candidate = Math.max(2, libraryPage - 1); candidate <= Math.min(libraryTotalPages - 1, libraryPage + 1); candidate++) pages.push(candidate);
+                if (libraryTotalPages > 1) pages.push(libraryTotalPages);
+                pages = pages.filter(function(value, index, list){ return list.indexOf(value) === index; }).sort(function(a,b){ return a - b; });
+                var previous = 0;
+                pages.forEach(function(page){ if (previous && page - previous > 1) addEllipsis(); addButton(String(page), page, page === libraryPage ? 'is-current' : '', page === libraryPage); previous = page; });
+                addButton('›', libraryPage + 1, '', libraryPage >= libraryTotalPages);
+            };
             var render = function(){
                 attachments.innerHTML = '';
-                if (!libraryLoaded) { var loading = document.createElement('li'); loading.className = 'yxf-empty'; loading.textContent = libraryLoading ? '正在加载文件…' : '文件列表将在打开“全部文件”时加载。'; attachments.appendChild(loading); return; }
-                if (libraryError) { var failed = document.createElement('li'); failed.className = 'yxf-empty'; failed.textContent = libraryError; attachments.appendChild(failed); return; }
+                if (!libraryLoaded) { var loading = document.createElement('li'); loading.className = 'yxf-empty'; loading.textContent = libraryLoading ? '正在加载文件…' : '文件列表正在后台准备。'; attachments.appendChild(loading); renderPagination(); return; }
+                if (libraryError) { var failed = document.createElement('li'); failed.className = 'yxf-empty'; failed.textContent = libraryError; attachments.appendChild(failed); renderPagination(); return; }
                 var filtered = visibleItems();
-                if (!filtered.length) { var empty = document.createElement('li'); empty.className = 'yxf-empty'; empty.textContent = items.length ? '没有符合条件的媒体文件。' : '图库暂无媒体文件，请先上传文件。'; attachments.appendChild(empty); return; }
+                if (!filtered.length) { var empty = document.createElement('li'); empty.className = 'yxf-empty'; empty.textContent = items.length ? '没有符合条件的媒体文件。' : '图库暂无媒体文件，请先上传文件。'; attachments.appendChild(empty); renderPagination(); return; }
                 filtered.forEach(function(item){
                     var node = document.createElement('li'); node.className = 'yxf-attachment' + (active && active.id === item.id ? ' is-selected' : ''); node.setAttribute('data-id', item.id); node.setAttribute('title', item.name);
                     if (item.kind === 'image') { var image = document.createElement('img'); image.src = item.url; image.alt = item.name; image.loading = 'lazy'; node.appendChild(image); }
                     else { var icon = document.createElement('div'); icon.className = 'yxf-file-icon'; icon.innerHTML = '<b>' + (item.kind === 'video' ? '▶' : item.kind === 'audio' ? '♫' : '⌁') + '</b><span>' + item.name + '</span>'; node.appendChild(icon); }
                     node.addEventListener('click', function(){ showDetails(item, true); render(); renderUploadedThumbs(); }); attachments.appendChild(node);
                 });
+                renderPagination();
             };
             Array.prototype.forEach.call(document.querySelectorAll('[data-yxf-tab]'), function(button){ button.addEventListener('click', function(){ switchTab(button.getAttribute('data-yxf-tab')); }); });
             refreshTypeOptions();
-            type.addEventListener('change', render); search.addEventListener('input', render);
+            type.addEventListener('change', function(){ if (libraryLoaded) { clearSelection(); loadLibrary(1); } });
+            search.addEventListener('input', function(){
+                if (!libraryLoaded) return;
+                window.clearTimeout(librarySearchTimer);
+                librarySearchTimer = window.setTimeout(function(){ clearSelection(); loadLibrary(1); }, 260);
+            });
             selectedUrl.addEventListener('input', function(){
                 var value = selectedUrl.value.trim();
                 // 用户编辑链接时，改用其手动输入的地址，不能再把先前选中的图库文件一并插入。
@@ -3216,6 +3304,8 @@ final class YouXianFeng_Gallery {
             }
             if (initialTab === 'library') switchTab('library');
             render(); updateFooter();
+            // 上传面板已经可交互后再预取首页；切到“全部文件”时即可直接展示。
+            if (initialTab !== 'library') window.setTimeout(function(){ loadLibrary(1); }, 80);
         }());
         </script>
         <?php
