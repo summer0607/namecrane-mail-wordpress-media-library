@@ -337,6 +337,39 @@
         return isVisible(dialog) ? dialog : null;
     }
 
+    function zibllForumTermCoverForm(input) {
+        if (!input || !input.matches || !input.matches('input[type="file"][zibupload="image_upload"]')) return false;
+        var form = input.closest && input.closest('form.term-form');
+        var taxonomy = form && form.querySelector('input[name="taxonomy"]');
+        return taxonomy && (taxonomy.value === 'forum_topic' || taxonomy.value === 'forum_tag') ? form : null;
+    }
+
+    function setFormValue(form, name, value) {
+        var field = form.querySelector('input[name="' + name + '"]');
+        if (!field) {
+            field = document.createElement('input');
+            field.type = 'hidden';
+            field.name = name;
+            form.appendChild(field);
+        }
+        field.value = String(value || '');
+    }
+
+    function applyZibllForumTermCover(form, item) {
+        var attachmentId = Number(item && item.attachmentId || 0);
+        var kind = String(item && (item.kind || (item.mime || '').split('/')[0]) || '').toLowerCase();
+        if (!item || !item.url || kind !== 'image' || attachmentId < 1) {
+            if (typeof window.notyf === 'function') window.notyf('请选择 NameCrane媒体库中的图片', 'warning');
+            return false;
+        }
+        setFormValue(form, 'yxf_gallery_term_cover_url', item.url);
+        setFormValue(form, 'yxf_gallery_term_cover_attachment_id', attachmentId);
+        var preview = form.querySelector('.form-upload .preview img');
+        if (preview) preview.src = String(item.url);
+        form.dispatchEvent(new CustomEvent('yxf-gallery-term-cover-selected', { bubbles: true, detail: { item: item } }));
+        return true;
+    }
+
     function urlFieldForFileInput(input, dialog) {
         if (!input || !dialog || $(dialog).hasClass('mini-media-modal')) return null;
         var roots = [];
@@ -401,9 +434,16 @@
         var input = fileInputFromUploadClick(event.target);
         var dialog = nearestMediaDialog(input);
         if (!input || !dialog || input.dataset.yxfGalleryKeepNative === '1') return;
+        var termCoverForm = zibllForumTermCoverForm(input);
 
         event.preventDefault();
         event.stopImmediatePropagation();
+        if (termCoverForm) {
+            openGallery({ type: 'image', multiple: 1 }, function (items) {
+                applyZibllForumTermCover(termCoverForm, (items || [])[0]);
+            });
+            return;
+        }
         var targetField = urlFieldForFileInput(input, dialog);
         var imageTarget = activeEditorImage();
         openGallery({ type: mediaTypeFromFileInput(input), multiple: input.multiple ? 99 : 1 }, function (items) {
@@ -426,6 +466,41 @@
             }
             if (replaceEditorImage(imageTarget, detail.items)) return;
             insertIntoActiveEditor(detail.items);
+        });
+    }, true);
+
+    // 子比的话题/标签表单原本只接受本地文件。选择 NameCrane 图片后，由插件提交
+    // 同一份表单数据和外链媒体标识，避免主题的原生上传器再次要求本地文件。
+    document.addEventListener('click', function (event) {
+        var button = event.target && event.target.closest ? event.target.closest('form.term-form [zibupload="submit"]') : null;
+        var form = button && button.closest('form.term-form');
+        var coverUrl = form && form.querySelector('input[name="yxf_gallery_term_cover_url"]');
+        if (!button || !form || !coverUrl || !coverUrl.value) return;
+
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (button.disabled) return;
+
+        var originalHtml = button.innerHTML;
+        button.disabled = true;
+        button.innerHTML = '<i class="loading mr3"></i>正在提交';
+        $.ajax({
+            url: config.ajaxUrl || (window._win && window._win.ajax_url) || window.ajaxurl,
+            type: 'POST',
+            data: new window.FormData(form),
+            processData: false,
+            contentType: false,
+            dataType: 'json'
+        }).done(function (data) {
+            if (typeof window.notyf === 'function') window.notyf(data.msg || (data.error ? '提交失败' : '操作成功'), data.ys || (data.error ? 'danger' : ''));
+            if (data.error) return;
+            if (data.hide_modal) $(form).closest('.modal').modal('hide');
+            $(button).trigger('miniuploaded', data);
+        }).fail(function () {
+            if (typeof window.notyf === 'function') window.notyf('提交失败，请稍后重试', 'danger');
+        }).always(function () {
+            button.disabled = false;
+            button.innerHTML = originalHtml;
         });
     }, true);
 
