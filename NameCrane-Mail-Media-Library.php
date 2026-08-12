@@ -2,7 +2,7 @@
 /**
  * Plugin Name: NameCrane邮箱媒体库
  * Description: 将媒体上传至 NameCrane 邮件存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 1.0.0
+ * Version: 1.0.5
  * Update URI: https://youxianfeng.com/
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '1.0.0';
+    const VERSION = '1.0.5';
     const DEFAULT_GALLERY_NAME = 'NameCrane媒体库';
     // 直接使用正式站主域名，避免非 www 域名跳转在部分旧版 cURL 中触发证书用途校验错误。
     const SERVICE_URL = 'https://www.youxianfeng.com/wp-json/namecrane-gallery/v1';
@@ -47,6 +47,10 @@ final class YouXianFeng_Gallery {
         add_action('wp_ajax_yxf_gallery_resolve_pending_item', array(__CLASS__, 'ajax_resolve_pending_item'));
         add_action('wp_ajax_yxf_gallery_media_items', array(__CLASS__, 'ajax_media_items'));
         add_action('wp_ajax_yxf_gallery_delete_remote_item', array(__CLASS__, 'ajax_delete_remote_item'));
+        // 子比前台话题/标签使用原生文件表单，不经过 wp.media。插件选中外链图片后，
+        // 在主题处理器之前保存同一表单，避免再次落回网站本地 uploads。
+        add_action('wp_ajax_save_forum_topic', array(__CLASS__, 'maybe_save_zibll_forum_term'), 0);
+        add_action('wp_ajax_save_forum_tag', array(__CLASS__, 'maybe_save_zibll_forum_term'), 0);
         // 邮箱网盘对刚通过 FTPS/SFTP 写入的文件需要短暂建立索引。
         // 解析公开链接放到异步任务中，不能让浏览器请求一直等待。
         add_action('yxf_gallery_resolve_pending_item', array(__CLASS__, 'resolve_pending_item_event'), 10, 2);
@@ -663,10 +667,116 @@ final class YouXianFeng_Gallery {
         wp_localize_script('yxf-gallery-media-replacement', 'YXFGalleryReplacement', array(
             // 前台统一使用站点自身地址，不触发 wp-admin 的权限和 AJAX 默认响应。
             'iframeUrl' => home_url('/'),
+            'ajaxUrl'   => admin_url('admin-ajax.php'),
             'loginUrl'  => self::login_url(),
             'hasLogin'  => self::user_has_login(),
             'enabled'   => true,
         ));
+    }
+
+    /** 使用 NameCrane 外链保存子比前台话题/标签封面，不复制文件到本地媒体库。 */
+    public static function maybe_save_zibll_forum_term() {
+        $cover_url = esc_url_raw(wp_unslash($_POST['yxf_gallery_term_cover_url'] ?? ''));
+        $attachment_id = absint($_POST['yxf_gallery_term_cover_attachment_id'] ?? 0);
+        if ($cover_url === '' || !$attachment_id) {
+            return;
+        }
+
+        $action = sanitize_key(wp_unslash($_REQUEST['action'] ?? ''));
+        $taxonomy = str_replace('save_', '', $action);
+        if (!in_array($taxonomy, array('forum_topic', 'forum_tag'), true)) {
+            return;
+        }
+
+        if (function_exists('zib_ajax_verify_nonce')) {
+            zib_ajax_verify_nonce('save_bbs');
+        } else {
+            check_ajax_referer('save_bbs');
+        }
+
+        $term_id = absint($_REQUEST['term_id'] ?? 0);
+        $can_save = function_exists('zib_bbs_current_user_can')
+            && zib_bbs_current_user_can($taxonomy . ($term_id ? '_edit' : '_add'), $term_id);
+        if (!$can_save) {
+            self::send_zibll_forum_term_error('您没有保存此内容的权限。');
+        }
+
+        $item_id = absint(get_post_meta($attachment_id, '_yxf_gallery_item_id', true));
+        global $wpdb;
+        $item = $item_id ? $wpdb->get_row($wpdb->prepare(
+            'SELECT * FROM ' . self::table_name() . ' WHERE id = %d AND status = %s LIMIT 1',
+            $item_id,
+            'ready'
+        )) : null;
+        $item_url = $item ? esc_url_raw(self::item_public_url($item)) : '';
+        $can_use_item = $item
+            && (int) ($item->attachment_id ?? 0) === $attachment_id
+            && strpos((string) ($item->mime_type ?? ''), 'image/') === 0
+            && hash_equals($item_url, $cover_url)
+            && (self::can_administer() || (int) ($item->author_id ?? 0) === get_current_user_id());
+        if (!$can_use_item) {
+            self::send_zibll_forum_term_error('所选图片无效，请重新从 NameCrane媒体库选择。');
+        }
+
+        $name = function_exists('zib_bbs_get_taxonomy_name') ? zib_bbs_get_taxonomy_name($taxonomy) : ($taxonomy === 'forum_topic' ? '话题' : '标签');
+        $title = !empty($_POST['title']) ? strip_tags(trim(wp_unslash($_POST['title']))) : '';
+        $content = !empty($_POST['desc']) ? strip_tags(trim(wp_unslash($_POST['desc']))) : '';
+        $slug = !empty($_POST['slug']) ? strip_tags(trim(wp_unslash($_POST['slug']))) : '';
+        $length = static function ($value) {
+            return function_exists('zib_new_strlen') ? zib_new_strlen($value) : mb_strlen($value);
+        };
+
+        if ($title === '') self::send_zibll_forum_term_error('请输入' . $name . '标题。', 'warning');
+        if ($length($title) > 10) self::send_zibll_forum_term_error('标题太长，不能超过10个字。');
+        if ($length($title) <= 1) self::send_zibll_forum_term_error('标题太短！');
+        if ($content === '') self::send_zibll_forum_term_error('请输入' . $name . '简介。', 'warning');
+        if ($length($content) > 50) self::send_zibll_forum_term_error('简介太长，不能超过50个字。');
+        if ($length($content) < 5) self::send_zibll_forum_term_error('简介太短！');
+
+        if (function_exists('_pz') && _pz('audit_bbs_term') && class_exists('ZibAudit')) {
+            ZibAudit::ajax_text($title . $content);
+        }
+
+        $args = array('name' => $title, 'description' => $content, 'slug' => $slug);
+        $result = $term_id ? wp_update_term($term_id, $taxonomy, $args) : wp_insert_term($title, $taxonomy, $args);
+        if (is_wp_error($result)) {
+            self::send_zibll_forum_term_error($result->get_error_message());
+        }
+
+        $saved_term_id = absint($result['term_id'] ?? 0);
+        if (function_exists('zib_update_term_meta')) {
+            zib_update_term_meta($saved_term_id, 'cover_image', $item_url);
+        } else {
+            update_term_meta($saved_term_id, 'cover_image', $item_url);
+        }
+        if (isset($_POST['add_limit'])) {
+            update_term_meta($saved_term_id, 'add_limit', sanitize_text_field(wp_unslash($_POST['add_limit'])));
+        }
+        if (function_exists('zib_flush_rewrite_rules')) {
+            zib_flush_rewrite_rules();
+        }
+
+        $data = array(
+            'image_url'  => $item_url,
+            'term_url'   => get_term_link($saved_term_id),
+            'msg'        => $name . ($term_id ? '编辑' : '创建') . '成功',
+            'term'       => get_term($saved_term_id, $taxonomy),
+            'term_id'    => $saved_term_id,
+            'taxonomy'   => $taxonomy,
+            'type'       => $term_id ? 'update' : 'add',
+            'hide_modal' => true,
+        );
+        if (function_exists('zib_send_json_success')) {
+            zib_send_json_success($data);
+        }
+        wp_send_json_success($data);
+    }
+
+    private static function send_zibll_forum_term_error($message, $type = 'danger') {
+        if (function_exists('zib_send_json_error')) {
+            zib_send_json_error($message, $type);
+        }
+        wp_send_json_error(array('message' => $message), 400);
     }
 
     /** 将 WordPress 后台的媒体库列表与“添加媒体”页统一转到 NameCrane 媒体库。 */
