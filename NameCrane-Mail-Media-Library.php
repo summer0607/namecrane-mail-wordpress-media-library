@@ -2,7 +2,7 @@
 /**
  * Plugin Name: NameCrane邮箱媒体库
  * Description: 将媒体上传至 NameCrane 邮件存储，自动生成公开链接，并替换 WordPress 与主题的媒体选择入口。
- * Version: 1.0.5
+ * Version: 1.0.6
  * Update URI: https://youxianfeng.com/
  * Author: 游先锋
  */
@@ -10,7 +10,7 @@
 defined('ABSPATH') || exit;
 
 final class YouXianFeng_Gallery {
-    const VERSION = '1.0.5';
+    const VERSION = '1.0.6';
     const DEFAULT_GALLERY_NAME = 'NameCrane媒体库';
     // 直接使用正式站主域名，避免非 www 域名跳转在部分旧版 cURL 中触发证书用途校验错误。
     const SERVICE_URL = 'https://www.youxianfeng.com/wp-json/namecrane-gallery/v1';
@@ -140,6 +140,7 @@ final class YouXianFeng_Gallery {
             'api_base'        => 'https://eu1.workspace.org',
             'replace_media_library' => 1,
             'hide_wordpress_media_menu' => 1,
+            'auto_convert_images_to_webp' => 0,
             'default_mailbox_username' => '',
             'default_mailbox_secret' => '',
             'connection_status' => 'not_connected',
@@ -311,6 +312,7 @@ final class YouXianFeng_Gallery {
         $settings = array_merge($current, array(
             'replace_media_library' => empty($_POST['replace_media_library']) ? 0 : 1,
             'hide_wordpress_media_menu' => empty($_POST['hide_wordpress_media_menu']) ? 0 : 1,
+            'auto_convert_images_to_webp' => empty($_POST['auto_convert_images_to_webp']) ? 0 : 1,
             'source_host'      => $server_host,
             'target_base'      => untrailingslashit($target),
             'storage_protocol' => $protocol,
@@ -1927,7 +1929,110 @@ final class YouXianFeng_Gallery {
         if (is_wp_error($validated)) {
             return $validated;
         }
-        return self::upload_local_file((string) $file['tmp_name'], (string) $file['name'], (int) $file['size'], false, $validated);
+        $prepared = self::prepare_image_for_upload((string) $file['tmp_name'], (string) $file['name'], (int) $file['size'], $validated);
+        if (is_wp_error($prepared)) {
+            return $prepared;
+        }
+        try {
+            return self::upload_local_file($prepared['tmp_name'], $prepared['file_name'], $prepared['file_size'], false, $prepared['validated']);
+        } finally {
+            self::cleanup_prepared_upload($prepared);
+        }
+    }
+
+    /** 开关启用时，在进入远程上传前将可安全转换的静态位图保存为 WebP。 */
+    private static function prepare_image_for_upload(string $tmp_name, string $file_name, int $file_size, array $validated) {
+        $prepared = array(
+            'tmp_name'  => $tmp_name,
+            'file_name' => $validated['file_name'],
+            'file_size' => $file_size,
+            'validated' => $validated,
+            'temporary' => false,
+        );
+        $settings = self::settings();
+        $extension = strtolower((string) ($validated['extension'] ?? ''));
+        if (empty($settings['auto_convert_images_to_webp']) || $extension === 'webp' || !self::should_convert_image_to_webp($tmp_name, $extension)) {
+            return $prepared;
+        }
+        if (!function_exists('wp_get_image_editor') || !wp_image_editor_supports(array('mime_type' => 'image/webp'))) {
+            return new WP_Error('webp_not_supported', '当前服务器不支持 WebP 转换，请关闭“自动将静态图片转为 WebP”或联系服务器管理员开启 WebP 支持。');
+        }
+
+        $editor = wp_get_image_editor($tmp_name);
+        if (is_wp_error($editor)) {
+            return new WP_Error('webp_source_unreadable', '图片无法转换为 WebP：' . $editor->get_error_message());
+        }
+        if (method_exists($editor, 'maybe_exif_rotate')) {
+            $rotated = $editor->maybe_exif_rotate();
+            if (is_wp_error($rotated)) {
+                return new WP_Error('webp_rotation_failed', '图片方向校正失败：' . $rotated->get_error_message());
+            }
+        }
+        $quality = max(40, min(95, absint(apply_filters('yxf_gallery_webp_quality', 82, $file_name))));
+        $editor->set_quality($quality);
+        $seed_path = wp_tempnam('namecrane-webp-' . wp_basename($file_name));
+        if (!$seed_path) {
+            return new WP_Error('webp_temp_failed', '无法创建 WebP 临时文件，请检查服务器临时目录。');
+        }
+        $webp_path = $seed_path . '.webp';
+        wp_delete_file($seed_path);
+        $saved = $editor->save($webp_path, 'image/webp');
+        if (is_wp_error($saved) || empty($saved['path']) || !is_file($saved['path'])) {
+            wp_delete_file($webp_path);
+            $message = is_wp_error($saved) ? $saved->get_error_message() : '转换结果未生成。';
+            return new WP_Error('webp_conversion_failed', '图片无法转换为 WebP：' . $message);
+        }
+
+        $base_name = pathinfo($validated['file_name'], PATHINFO_FILENAME);
+        $webp_name = sanitize_file_name(($base_name !== '' ? $base_name : 'image') . '.webp');
+        $webp_size = (int) filesize($saved['path']);
+        $webp_validated = self::validate_gallery_upload_file($saved['path'], $webp_name, $webp_size);
+        if (is_wp_error($webp_validated)) {
+            wp_delete_file($saved['path']);
+            return $webp_validated;
+        }
+        return array(
+            'tmp_name'  => $saved['path'],
+            'file_name' => $webp_name,
+            'file_size' => $webp_size,
+            'validated' => $webp_validated,
+            'temporary' => true,
+        );
+    }
+
+    /** SVG 保持矢量格式；动图 GIF 保持动画，静态 GIF 可正常转为 WebP。 */
+    private static function should_convert_image_to_webp(string $tmp_name, string $extension) {
+        if (!in_array($extension, array('jpg', 'jpeg', 'png', 'gif', 'avif', 'bmp', 'heic', 'ico'), true)) {
+            return false;
+        }
+        return $extension !== 'gif' || !self::is_animated_gif($tmp_name);
+    }
+
+    /** 流式检查 GIF 帧，避免为了识别动图将整个文件读入内存。 */
+    private static function is_animated_gif(string $file_path) {
+        $stream = @fopen($file_path, 'rb');
+        if (!$stream) {
+            return false;
+        }
+        $frames = 0;
+        $tail = '';
+        while (!feof($stream) && $frames < 2) {
+            $chunk = fread($stream, 65536);
+            if ($chunk === false) {
+                break;
+            }
+            $data = $tail . $chunk;
+            $frames += substr_count($data, "\x21\xF9\x04");
+            $tail = substr($data, -2);
+        }
+        fclose($stream);
+        return $frames > 1;
+    }
+
+    private static function cleanup_prepared_upload(array $prepared) {
+        if (!empty($prepared['temporary']) && !empty($prepared['tmp_name']) && is_file($prepared['tmp_name'])) {
+            wp_delete_file($prepared['tmp_name']);
+        }
     }
 
     /**
@@ -1948,7 +2053,20 @@ final class YouXianFeng_Gallery {
         }
 
         // Steam 导入等后台自动流程需要在当前请求内直接得到链接，保持原有行为。
-        $result = self::upload_local_file($tmp_name, $file_name, (int) filesize($tmp_name), true);
+        $file_size = (int) filesize($tmp_name);
+        $validated = self::validate_gallery_upload_file($tmp_name, $file_name, $file_size);
+        if (is_wp_error($validated)) {
+            return $validated;
+        }
+        $prepared = self::prepare_image_for_upload($tmp_name, $file_name, $file_size, $validated);
+        if (is_wp_error($prepared)) {
+            return $prepared;
+        }
+        try {
+            $result = self::upload_local_file($prepared['tmp_name'], $prepared['file_name'], $prepared['file_size'], true, $prepared['validated']);
+        } finally {
+            self::cleanup_prepared_upload($prepared);
+        }
         if (is_wp_error($result)) {
             return $result;
         }
@@ -2706,6 +2824,10 @@ final class YouXianFeng_Gallery {
                     <tr>
                         <th scope="row">隐藏 WordPress 媒体库菜单</th>
                         <td><label><input type="checkbox" name="hide_wordpress_media_menu" value="1" <?php checked(!empty($settings['hide_wordpress_media_menu'])); ?>> 隐藏后台左侧的 WordPress 原生“媒体”菜单</label><p class="description">默认勾选。仅隐藏菜单入口，不删除原媒体文件，也不影响主题或插件调用媒体接口。</p></td>
+                    </tr>
+                    <tr>
+                        <th scope="row">自动将图片格式转为 WebP</th>
+                        <td><label><input type="checkbox" name="auto_convert_images_to_webp" value="1" <?php checked(!empty($settings['auto_convert_images_to_webp'])); ?>> 上传时自动将静态图片保存为 WebP 格式</label><p class="description">勾选后，通过 <?php echo esc_html(self::brand_name()); ?> 上传的 JPG、PNG 等静态位图会先在服务器本地快速转换，再上传较小的 WebP 文件并生成链接。已是 WebP、SVG 矢量图和动态 GIF 保持原格式。</p></td>
                     </tr>
                 </table>
                 <hr>
